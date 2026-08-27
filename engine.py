@@ -76,8 +76,16 @@ class OptionsDataIngestion:
 
         df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
         df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0)
-        df["LTP"] = pd.to_numeric(df["LTP"] if "LTP" in df.columns else 0, errors="coerce").fillna(0.0)
-        df["OI_Change"] = pd.to_numeric(df["OI_Change"] if "OI_Change" in df.columns else 0, errors="coerce").fillna(0)
+        
+        # Safely handle LTP
+        if "LTP" not in df.columns:
+            df["LTP"] = 0.0
+        df["LTP"] = pd.to_numeric(df["LTP"], errors="coerce").fillna(0.0)
+        
+        # Safely handle OI_Change
+        if "OI_Change" not in df.columns:
+            df["OI_Change"] = 0.0
+        df["OI_Change"] = pd.to_numeric(df["OI_Change"], errors="coerce").fillna(0)
 
         if "Expiry_Date" in df.columns:
             df["Expiry_Date"] = pd.to_datetime(df["Expiry_Date"], errors="coerce")
