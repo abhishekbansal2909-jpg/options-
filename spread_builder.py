@@ -1,6 +1,5 @@
 import pandas as pd
 import requests
-import io
 
 class SpreadBuilderEngine:
     """Pairs OTM option strikes into vertical credit spreads, computes R:R, and calculates real-world INR risk."""
@@ -9,32 +8,28 @@ class SpreadBuilderEngine:
 
     @classmethod
     def fetch_lot_sizes(cls):
-        """Silently scrapes the live FO Market Lots CSV directly from NSE servers."""
+        """Silently scrapes live lot sizes from Zerodha's open API instrument dump."""
         if cls._lot_sizes: 
             return cls._lot_sizes
         
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            session = requests.Session()
-            session.get("https://www.nseindia.com", headers=headers, timeout=5)
+            # Tap into Zerodha's open unauthenticated daily dump
+            url = "https://api.kite.trade/instruments"
+            df = pd.read_csv(url)
             
-            url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
-            res = session.get(url, headers=headers, timeout=5)
+            # Filter strictly for the NSE F&O segment
+            nfo_df = df[df['exchange'] == 'NFO'].copy()
             
-            if res.status_code == 200:
-                df = pd.read_csv(io.StringIO(res.text))
-                df.columns = df.columns.str.strip().str.upper()
-                df['SYMBOL'] = df['SYMBOL'].astype(str).str.strip().str.upper()
-                
-                lot_cols = [c for c in df.columns if '-' in c]
-                if lot_cols:
-                    cls._lot_sizes = pd.Series(
-                        df[lot_cols[0]].astype(str).str.strip().str.replace(',', ''), 
-                        index=df['SYMBOL']
-                    ).apply(pd.to_numeric, errors='coerce').to_dict()
+            # Extract unique symbols and their lot sizes
+            lot_map = nfo_df.drop_duplicates(subset=['name'])[['name', 'lot_size']]
+            
+            cls._lot_sizes = pd.Series(
+                lot_map['lot_size'].values, 
+                index=lot_map['name'].str.strip().str.upper()
+            ).to_dict()
                     
         except Exception as e:
-            print(f"Lot size fetch failed: {e}")
+            print(f"Kite lot size fetch failed: {e}")
             
         return cls._lot_sizes
 
@@ -45,8 +40,6 @@ class SpreadBuilderEngine:
         
         for sym, group in df.groupby("Symbol"):
             spot_price = group['Spot_Price'].iloc[0]
-            
-            # THE FIX: Default to 1 if the NSE scraper gets blocked by their firewall
             lot_size = lot_dict.get(sym, 1) 
                 
             # ----------------------------------------------------
