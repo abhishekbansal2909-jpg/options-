@@ -44,16 +44,18 @@ class OptionsDataIngestion:
             "OPTNTP": "Option_Type", "OPTIONTYP": "Option_Type", "OPTIONTYPE": "Option_Type",
             "STRKPRIC": "Strike", "STRKPRC": "Strike", "STRIKEPRC": "Strike", "STRIKE": "Strike",
             "OPNINTRST": "OI", "OINOCON": "OI", "OPENINT": "OI", "OI": "OI",
-            "CHGINOI": "OI_Change", "CHGOI": "OI_Change", "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change",
+            # Added the exact UDiFF mapping here:
+            "CHNGINOPNINTRST": "OI_Change", "CHGINOI": "OI_Change", "CHGOI": "OI_Change", 
+            "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change",
             "CLSPRIC": "LTP", "SETTLMPRIC": "LTP", "CLOSEPRIC": "LTP", "CLOSE": "LTP", "LTP": "LTP",
             "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date", "XPIRYDT": "Expiry_Date",
             "EXPRYDT": "Expiry_Date", "EXPIRATIONDATE": "Expiry_Date", "EXPIRYDATE": "Expiry_Date"
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
 
-        # Fuzzy search for OI Change if the hardcoded mapper missed it
+        # Upgraded fuzzy search to catch "OPNINTRST" variations
         if "OI_Change" not in df.columns:
-            fuzzy_oi_cols = [c for c in df.columns if "CHG" in c and "OI" in c]
+            fuzzy_oi_cols = [c for c in df.columns if ("CHG" in c or "CHNG" in c) and ("OI" in c or "OPN" in c)]
             if fuzzy_oi_cols:
                 df["OI_Change"] = df[fuzzy_oi_cols[0]]
 
