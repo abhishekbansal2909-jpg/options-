@@ -1,132 +1,145 @@
-
-import streamlit as st
 import pandas as pd
-import os
-from engine import OptionsDataIngestion
-from spotexpiry import SpotAndExpiryEngine
-from spread_builder import SpreadBuilderEngine
+import requests
+import io
 
-def get_fii_tide(filepath):
-    try:
-        df = pd.read_csv(filepath)
-        header_row_idx = None
-        for idx in range(min(5, len(df))):
-            row_vals = [str(x).upper() for x in df.iloc[idx].dropna().tolist()]
-            row_str = " ".join(row_vals)
-            if "CLIENT" in row_str or "PARTICIPANT" in row_str or "FUTURE" in row_str:
-                header_row_idx = idx + 1
-                break
-                
-        if header_row_idx is not None:
-            df = pd.read_csv(filepath, skiprows=header_row_idx)
-                    
-        df.columns = df.columns.astype(str).str.strip().str.upper().str.replace(" ", "_").str.replace("\t", "")
+class SpreadBuilderEngine:
+    """Pairs OTM option strikes into vertical credit spreads, computes R:R, and calculates real-world INR risk."""
+    
+    _lot_sizes = {}
+
+    @classmethod
+    def fetch_lot_sizes(cls):
+        """Silently scrapes the live FO Market Lots CSV directly from NSE servers."""
+        if cls._lot_sizes: 
+            return cls._lot_sizes
         
-        client_col = next((c for c in df.columns if any(k in c for k in ["CLIENT", "PARTIC"])), df.columns[0] if len(df.columns) > 0 else None)
-        fut_long_col = next((c for c in df.columns if "FUTURE_INDEX_LONG" in c or "FUTIDX_LONG" in c), None)
-        fut_short_col = next((c for c in df.columns if "FUTURE_INDEX_SHORT" in c or "FUTIDX_SHORT" in c), None)
-
-        if not client_col or not fut_long_col or not fut_short_col:
-            return "UNAVAILABLE", 50.0
+        try:
+            # NSE blocks automated bots, so we mimic a standard Chrome browser
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            session = requests.Session()
             
-        df[client_col] = df[client_col].astype(str).str.strip().str.upper()
-        fii_rows = df[df[client_col].str.contains("FII|FPI|FOREIGN", case=False, na=False)]
-        
-        if fii_rows.empty:
-            return "UNAVAILABLE", 50.0
+            # Ping main site first to establish a session cookie
+            session.get("https://www.nseindia.com", headers=headers, timeout=5)
             
-        fii_long = float(pd.to_numeric(fii_rows[fut_long_col].values[0], errors="coerce") or 0)
-        fii_short = float(pd.to_numeric(fii_rows[fut_short_col].values[0], errors="coerce") or 0)
+            # Download the live lot size CSV
+            url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
+            res = session.get(url, headers=headers, timeout=5)
+            
+            if res.status_code == 200:
+                df = pd.read_csv(io.StringIO(res.text))
+                df.columns = df.columns.str.strip().str.upper()
+                df['SYMBOL'] = df['SYMBOL'].astype(str).str.strip().str.upper()
+                
+                # The lot size is always listed under the front-month column (e.g., 'AUG-26')
+                lot_cols = [c for c in df.columns if '-' in c]
+                if lot_cols:
+                    # Clean commas and map to dictionary
+                    cls._lot_sizes = pd.Series(
+                        df[lot_cols[0]].astype(str).str.strip().str.replace(',', ''), 
+                        index=df['SYMBOL']
+                    ).apply(pd.to_numeric, errors='coerce').to_dict()
+                    
+        except Exception as e:
+            print(f"Lot size fetch failed: {e}")
+            
+        return cls._lot_sizes
+
+    @staticmethod
+    def build_spreads(df: pd.DataFrame) -> pd.DataFrame:
+        # 1. Fetch live lot sizes
+        lot_dict = SpreadBuilderEngine.fetch_lot_sizes()
+        spreads = []
         
-        total = fii_long + fii_short
-        fii_ratio = round((fii_long / total) * 100, 2) if total > 0 else 50.0
-        
-        if fii_ratio >= 60.0:
-            return "🟢 GREEN TIDE (FII Net Long)", fii_ratio
-        elif fii_ratio <= 40.0:
-            return "🔴 RED TIDE (FII Net Short)", fii_ratio
-        else:
-            return "⚪ NEUTRAL TIDE (Balanced)", fii_ratio
-    except Exception as e:
-        return f"ERROR ({str(e)})", 50.0
-
-st.set_page_config(page_title="Quantitative Spread Engine", layout="wide")
-st.title("🦅 Options Credit Spread Dashboard")
-st.markdown("Ranked by Risk-to-Reward efficiency with institutional wall validation.")
-
-# Sidebar Data Inputs
-st.sidebar.header("Data Ingestion")
-bhavcopy_file = st.sidebar.file_uploader("Upload NSE Bhavcopy (ZIP/CSV)", type=['csv', 'zip'])
-participant_file = st.sidebar.file_uploader("Upload Participant OI (CSV)", type=['csv'])
-
-# Optional interactive filter (Defaults to Show All)
-strategy_filter = st.sidebar.multiselect(
-    "Strategy Filter", 
-    options=["Bear Call Spread", "Bull Put Spread"],
-    default=["Bear Call Spread", "Bull Put Spread"]
-)
-
-if st.sidebar.button("Run Quantitative Scan"):
-    if bhavcopy_file is None:
-        st.sidebar.error("⚠️ Please upload a Bhavcopy file to proceed.")
-    else:
-        with st.spinner("Processing option chains and computing Risk/Reward ratios..."):
-            temp_path = None
-            temp_part_path = None
-            try:
-                # Macro Tide Banner
-                if participant_file is not None:
-                    temp_part_path = f"temp_{participant_file.name}"
-                    with open(temp_part_path, "wb") as f:
-                        f.write(participant_file.getbuffer())
-                    tide_status, tide_ratio = get_fii_tide(temp_part_path)
-                    st.info(f"**MACRO TIDE:** {tide_status} | **FII Long Ratio:** {tide_ratio}%")
-
-                temp_path = f"temp_{bhavcopy_file.name}"
-                with open(temp_path, "wb") as f:
-                    f.write(bhavcopy_file.getbuffer())
-                    
-                ingestion = OptionsDataIngestion(file_path=temp_path)
-                raw_df = ingestion.load_bhavcopy()
+        for sym, group in df.groupby("Symbol"):
+            spot_price = group['Spot_Price'].iloc[0]
+            lot_size = lot_dict.get(sym, 0) # Returns 0 if mapping fails
+            
+            # Skip if we couldn't map a valid lot size to avoid broken math
+            if lot_size <= 0:
+                continue
                 
-                active_df = SpotAndExpiryEngine.filter_front_month_expiry(raw_df)
-                synced_df = SpotAndExpiryEngine.sync_spot_prices(active_df)
+            # ----------------------------------------------------
+            # BEAR CALL SPREAD (Hunting Ceilings)
+            # ----------------------------------------------------
+            ce_data = group[(group['Option_Type'] == 'CE') & (group['Strike'] > spot_price)].copy()
+            ce_data = ce_data.sort_values(by='Strike', ascending=True)
+            
+            if len(ce_data) >= 2:
+                ce_wall = ce_data.loc[ce_data['OI'].idxmax()]
+                short_strike_ce = ce_wall['Strike']
                 
-                spreads_df = SpreadBuilderEngine.build_spreads(synced_df)
+                ce_hedge_data = ce_data[ce_data['Strike'] > short_strike_ce]
+                if not ce_hedge_data.empty:
+                    ce_hedge = ce_hedge_data.iloc[0]
+                    long_strike_ce = ce_hedge['Strike']
+                    
+                    net_prem_ce = round(ce_wall['LTP'] - ce_hedge['LTP'], 2)
+                    spread_width_ce = round(long_strike_ce - short_strike_ce, 2)
+                    max_risk_ce = round(spread_width_ce - net_prem_ce, 2)
+                    
+                    if net_prem_ce > 0 and max_risk_ce > 0:
+                        rr_ratio_ce = round(max_risk_ce / net_prem_ce, 2)
+                        safety_ce = round(((short_strike_ce - spot_price) / spot_price) * 100, 2)
+                        oi_chg_ce = ce_wall.get('OI_Change', 0)
+                        
+                        spreads.append({
+                            "Symbol": sym,
+                            "Spot_Price": spot_price,
+                            "Strategy": "Bear Call Spread",
+                            "Setup": f"Sell {short_strike_ce} CE / Buy {long_strike_ce} CE",
+                            "Risk_Reward": f"{rr_ratio_ce}:1",
+                            "RR_Ratio": rr_ratio_ce,
+                            "Safety_Buffer_%": safety_ce,
+                            "Lot_Size": lot_size,
+                            "Net_Premium": net_prem_ce,
+                            "Max_Profit_₹": round(net_prem_ce * lot_size, 2),
+                            "Max_Risk_₹": round(max_risk_ce * lot_size, 2),
+                            "Wall_Strength": "🟢 Reinforced" if oi_chg_ce > 0 else ("🔴 Crumbling" if oi_chg_ce < 0 else "⚪ Neutral"),
+                            "Wall_OI": int(ce_wall['OI']),
+                        })
+
+            # ----------------------------------------------------
+            # BULL PUT SPREAD (Hunting Floors)
+            # ----------------------------------------------------
+            pe_data = group[(group['Option_Type'] == 'PE') & (group['Strike'] < spot_price)].copy()
+            pe_data = pe_data.sort_values(by='Strike', ascending=False)
+            
+            if len(pe_data) >= 2:
+                pe_wall = pe_data.loc[pe_data['OI'].idxmax()]
+                short_strike_pe = pe_wall['Strike']
                 
-                if not spreads_df.empty:
-                    # Apply optional UI strategy filter without hard-deleting underlying data
-                    display_df = spreads_df[spreads_df["Strategy"].isin(strategy_filter)].copy()
+                pe_hedge_data = pe_data[pe_data['Strike'] < short_strike_pe]
+                if not pe_hedge_data.empty:
+                    pe_hedge = pe_hedge_data.iloc[0]
+                    long_strike_pe = pe_hedge['Strike']
                     
-                    st.success(f"Generated {len(display_df)} setups ranked by Risk:Reward efficiency.")
+                    net_prem_pe = round(pe_wall['LTP'] - pe_hedge['LTP'], 2)
+                    spread_width_pe = round(short_strike_pe - long_strike_pe, 2)
+                    max_risk_pe = round(spread_width_pe - net_prem_pe, 2)
                     
-                    # Columns to render
-                    cols_to_show = [
-                        'Symbol', 'Strategy', 'Setup', 'Spot_Price', 
-                        'Risk_Reward', 'Safety_Buffer_%', 'Net_Premium', 
-                        'Max_Risk_Pts', 'Wall_Strength', 'Wall_OI'
-                    ]
-                    
-                    st.dataframe(
-                        display_df[cols_to_show].style.background_gradient(
-                            subset=['Safety_Buffer_%'], cmap='RdYlGn'
-                        ).format({
-                            'Spot_Price': '₹{:.2f}',
-                            'Safety_Buffer_%': '{:.2f}%',
-                            'Net_Premium': '₹{:.2f}',
-                            'Max_Risk_Pts': '₹{:.2f}',
-                            'Wall_OI': '{:,}'
-                        }),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.error("No valid credit spread structures found in the uploaded Bhavcopy.")
-                    
-            except Exception as e:
-                st.error(f"Pipeline Error: {str(e)}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-                if temp_part_path and os.path.exists(temp_part_path):
-                    os.remove(temp_part_path)
+                    if net_prem_pe > 0 and max_risk_pe > 0:
+                        rr_ratio_pe = round(max_risk_pe / net_prem_pe, 2)
+                        safety_pe = round(((spot_price - short_strike_pe) / spot_price) * 100, 2)
+                        oi_chg_pe = pe_wall.get('OI_Change', 0)
+                        
+                        spreads.append({
+                            "Symbol": sym,
+                            "Spot_Price": spot_price,
+                            "Strategy": "Bull Put Spread",
+                            "Setup": f"Sell {short_strike_pe} PE / Buy {long_strike_pe} PE",
+                            "Risk_Reward": f"{rr_ratio_pe}:1",
+                            "RR_Ratio": rr_ratio_pe,
+                            "Safety_Buffer_%": safety_pe,
+                            "Lot_Size": lot_size,
+                            "Net_Premium": net_prem_pe,
+                            "Max_Profit_₹": round(net_prem_pe * lot_size, 2),
+                            "Max_Risk_₹": round(max_risk_pe * lot_size, 2),
+                            "Wall_Strength": "🟢 Reinforced" if oi_chg_pe > 0 else ("🔴 Crumbling" if oi_chg_pe < 0 else "⚪ Neutral"),
+                            "Wall_OI": int(pe_wall['OI']),
+                        })
+
+        final_df = pd.DataFrame(spreads)
+        if not final_df.empty:
+            final_df = final_df.sort_values(by="RR_Ratio", ascending=True).reset_index(drop=True)
+            
+        return final_df
