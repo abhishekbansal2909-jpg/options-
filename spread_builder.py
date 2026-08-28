@@ -1,18 +1,65 @@
 import pandas as pd
+import requests
+import io
 
 class SpreadBuilderEngine:
-    """Pairs OTM option strikes into vertical credit spreads, computes R:R, and tracks wall strength."""
+    """Pairs OTM option strikes into vertical credit spreads, computes R:R, and calculates real-world INR risk."""
     
+    _lot_sizes = {}
+
+    @classmethod
+    def fetch_lot_sizes(cls):
+        """Silently scrapes the live FO Market Lots CSV directly from NSE servers."""
+        if cls._lot_sizes: 
+            return cls._lot_sizes
+        
+        try:
+            # NSE blocks automated bots, so we mimic a standard Chrome browser
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            session = requests.Session()
+            
+            # Ping main site first to establish a session cookie
+            session.get("https://www.nseindia.com", headers=headers, timeout=5)
+            
+            # Download the live lot size CSV
+            url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
+            res = session.get(url, headers=headers, timeout=5)
+            
+            if res.status_code == 200:
+                df = pd.read_csv(io.StringIO(res.text))
+                df.columns = df.columns.str.strip().str.upper()
+                df['SYMBOL'] = df['SYMBOL'].astype(str).str.strip().str.upper()
+                
+                # The lot size is always listed under the front-month column (e.g., 'AUG-26')
+                lot_cols = [c for c in df.columns if '-' in c]
+                if lot_cols:
+                    # Clean commas and map to dictionary
+                    cls._lot_sizes = pd.Series(
+                        df[lot_cols[0]].astype(str).str.strip().str.replace(',', ''), 
+                        index=df['SYMBOL']
+                    ).apply(pd.to_numeric, errors='coerce').to_dict()
+                    
+        except Exception as e:
+            print(f"Lot size fetch failed: {e}")
+            
+        return cls._lot_sizes
+
     @staticmethod
     def build_spreads(df: pd.DataFrame) -> pd.DataFrame:
+        # 1. Fetch live lot sizes
+        lot_dict = SpreadBuilderEngine.fetch_lot_sizes()
         spreads = []
         
-        # Group by underlying stock
         for sym, group in df.groupby("Symbol"):
             spot_price = group['Spot_Price'].iloc[0]
+            lot_size = lot_dict.get(sym, 0) # Returns 0 if mapping fails
             
+            # Skip if we couldn't map a valid lot size to avoid broken math
+            if lot_size <= 0:
+                continue
+                
             # ----------------------------------------------------
-            # 1. BEAR CALL SPREAD (Hunting Ceilings)
+            # BEAR CALL SPREAD (Hunting Ceilings)
             # ----------------------------------------------------
             ce_data = group[(group['Option_Type'] == 'CE') & (group['Strike'] > spot_price)].copy()
             ce_data = ce_data.sort_values(by='Strike', ascending=True)
@@ -40,19 +87,19 @@ class SpreadBuilderEngine:
                             "Spot_Price": spot_price,
                             "Strategy": "Bear Call Spread",
                             "Setup": f"Sell {short_strike_ce} CE / Buy {long_strike_ce} CE",
-                            "Spread_Width": spread_width_ce,
-                            "Net_Premium": net_prem_ce,
-                            "Max_Risk_Pts": max_risk_ce,
                             "Risk_Reward": f"{rr_ratio_ce}:1",
                             "RR_Ratio": rr_ratio_ce,
                             "Safety_Buffer_%": safety_ce,
+                            "Lot_Size": lot_size,
+                            "Net_Premium": net_prem_ce,
+                            "Max_Profit_₹": round(net_prem_ce * lot_size, 2),
+                            "Max_Risk_₹": round(max_risk_ce * lot_size, 2),
+                            "Wall_Strength": "🟢 Reinforced" if oi_chg_ce > 0 else ("🔴 Crumbling" if oi_chg_ce < 0 else "⚪ Neutral"),
                             "Wall_OI": int(ce_wall['OI']),
-                            "Wall_OI_Chg": int(oi_chg_ce),
-                            "Wall_Strength": "🟢 Reinforced" if oi_chg_ce > 0 else ("🔴 Crumbling" if oi_chg_ce < 0 else "⚪ Neutral")
                         })
 
             # ----------------------------------------------------
-            # 2. BULL PUT SPREAD (Hunting Floors)
+            # BULL PUT SPREAD (Hunting Floors)
             # ----------------------------------------------------
             pe_data = group[(group['Option_Type'] == 'PE') & (group['Strike'] < spot_price)].copy()
             pe_data = pe_data.sort_values(by='Strike', ascending=False)
@@ -80,20 +127,19 @@ class SpreadBuilderEngine:
                             "Spot_Price": spot_price,
                             "Strategy": "Bull Put Spread",
                             "Setup": f"Sell {short_strike_pe} PE / Buy {long_strike_pe} PE",
-                            "Spread_Width": spread_width_pe,
-                            "Net_Premium": net_prem_pe,
-                            "Max_Risk_Pts": max_risk_pe,
                             "Risk_Reward": f"{rr_ratio_pe}:1",
                             "RR_Ratio": rr_ratio_pe,
                             "Safety_Buffer_%": safety_pe,
+                            "Lot_Size": lot_size,
+                            "Net_Premium": net_prem_pe,
+                            "Max_Profit_₹": round(net_prem_pe * lot_size, 2),
+                            "Max_Risk_₹": round(max_risk_pe * lot_size, 2),
+                            "Wall_Strength": "🟢 Reinforced" if oi_chg_pe > 0 else ("🔴 Crumbling" if oi_chg_pe < 0 else "⚪ Neutral"),
                             "Wall_OI": int(pe_wall['OI']),
-                            "Wall_OI_Chg": int(oi_chg_pe),
-                            "Wall_Strength": "🟢 Reinforced" if oi_chg_pe > 0 else ("🔴 Crumbling" if oi_chg_pe < 0 else "⚪ Neutral")
                         })
 
         final_df = pd.DataFrame(spreads)
         if not final_df.empty:
-            # Sort ascending by Risk-to-Reward ratio (Lowest risk multiple at top)
             final_df = final_df.sort_values(by="RR_Ratio", ascending=True).reset_index(drop=True)
             
         return final_df
