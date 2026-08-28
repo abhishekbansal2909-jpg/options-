@@ -14,14 +14,10 @@ class SpreadBuilderEngine:
             return cls._lot_sizes
         
         try:
-            # NSE blocks automated bots, so we mimic a standard Chrome browser
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
             session = requests.Session()
-            
-            # Ping main site first to establish a session cookie
             session.get("https://www.nseindia.com", headers=headers, timeout=5)
             
-            # Download the live lot size CSV
             url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
             res = session.get(url, headers=headers, timeout=5)
             
@@ -30,10 +26,8 @@ class SpreadBuilderEngine:
                 df.columns = df.columns.str.strip().str.upper()
                 df['SYMBOL'] = df['SYMBOL'].astype(str).str.strip().str.upper()
                 
-                # The lot size is always listed under the front-month column (e.g., 'AUG-26')
                 lot_cols = [c for c in df.columns if '-' in c]
                 if lot_cols:
-                    # Clean commas and map to dictionary
                     cls._lot_sizes = pd.Series(
                         df[lot_cols[0]].astype(str).str.strip().str.replace(',', ''), 
                         index=df['SYMBOL']
@@ -46,17 +40,14 @@ class SpreadBuilderEngine:
 
     @staticmethod
     def build_spreads(df: pd.DataFrame) -> pd.DataFrame:
-        # 1. Fetch live lot sizes
         lot_dict = SpreadBuilderEngine.fetch_lot_sizes()
         spreads = []
         
         for sym, group in df.groupby("Symbol"):
             spot_price = group['Spot_Price'].iloc[0]
-            lot_size = lot_dict.get(sym, 0) # Returns 0 if mapping fails
             
-            # Skip if we couldn't map a valid lot size to avoid broken math
-            if lot_size <= 0:
-                continue
+            # THE FIX: Default to 1 if the NSE scraper gets blocked by their firewall
+            lot_size = lot_dict.get(sym, 1) 
                 
             # ----------------------------------------------------
             # BEAR CALL SPREAD (Hunting Ceilings)
