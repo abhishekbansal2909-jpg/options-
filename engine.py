@@ -35,27 +35,27 @@ class OptionsDataIngestion:
         else:
             df = pd.read_csv(self.file_path, low_memory=False)
 
+        # Standardize headers by removing spaces and underscores
         df.columns = df.columns.astype(str).str.strip().str.upper().str.replace("_", "").str.replace(" ", "")
 
         # Map known UDiFF & legacy variations
         column_map = {
-            # Symbol
             "TCKRSYMB": "Symbol", "TRADGSYMB": "Symbol", "UNDRLNGST": "Symbol", "SYMBOL": "Symbol",
-            # Option Type
             "OPTNTP": "Option_Type", "OPTIONTYP": "Option_Type", "OPTIONTYPE": "Option_Type",
-            # Strike
             "STRKPRIC": "Strike", "STRKPRC": "Strike", "STRIKEPRC": "Strike", "STRIKE": "Strike",
-            # Open Interest
             "OPNINTRST": "OI", "OINOCON": "OI", "OPENINT": "OI", "OI": "OI",
-            # OI Change
-            "CHGINOI": "OI_Change", "CHGOI": "OI_Change", "CHNGINOI": "OI_Change",
-            # Price
+            "CHGINOI": "OI_Change", "CHGOI": "OI_Change", "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change",
             "CLSPRIC": "LTP", "SETTLMPRIC": "LTP", "CLOSEPRIC": "LTP", "CLOSE": "LTP", "LTP": "LTP",
-            # Expiry
             "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date", "XPIRYDT": "Expiry_Date",
             "EXPRYDT": "Expiry_Date", "EXPIRATIONDATE": "Expiry_Date", "EXPIRYDATE": "Expiry_Date"
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
+
+        # Fuzzy search for OI Change if the hardcoded mapper missed it
+        if "OI_Change" not in df.columns:
+            fuzzy_oi_cols = [c for c in df.columns if "CHG" in c and "OI" in c]
+            if fuzzy_oi_cols:
+                df["OI_Change"] = df[fuzzy_oi_cols[0]]
 
         # Fallback extraction from CONTRACT_D
         if "CONTRACTD" in df.columns:
@@ -77,12 +77,10 @@ class OptionsDataIngestion:
         df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
         df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0)
         
-        # Safely handle LTP
         if "LTP" not in df.columns:
             df["LTP"] = 0.0
         df["LTP"] = pd.to_numeric(df["LTP"], errors="coerce").fillna(0.0)
         
-        # Safely handle OI_Change
         if "OI_Change" not in df.columns:
             df["OI_Change"] = 0.0
         df["OI_Change"] = pd.to_numeric(df["OI_Change"], errors="coerce").fillna(0)
