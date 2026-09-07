@@ -3,3 +3,4 @@ pandas
 yfinance
 matplotlib
 requests
+scipy
