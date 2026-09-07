@@ -4,3 +4,4 @@ yfinance
 matplotlib
 requests
 scipy
+numpy
