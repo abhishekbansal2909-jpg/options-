@@ -78,6 +78,8 @@ class SpreadBuilderEngine:
                         spreads.append({
                             "Symbol": sym, "Strategy": "Bear Call Spread", "Score": score_ce,
                             "Setup": f"Sell {short_strike_ce} CE / Buy {long_strike_ce} CE",
+                            "Spot_Price": spot_price,
+                            "Risk_Reward": f"{rr_ratio_ce}:1",
                             "RR_Ratio": rr_ratio_ce, "Net_Premium": net_prem_ce,
                             "Short_Delta": delta_ce, "ATR_Moat": moat_atr_ce,
                             "Pass_Delta": ce_wall.get('Pass_Delta', False), 
@@ -129,6 +131,8 @@ class SpreadBuilderEngine:
                         spreads.append({
                             "Symbol": sym, "Strategy": "Bull Put Spread", "Score": score_pe,
                             "Setup": f"Sell {short_strike_pe} PE / Buy {long_strike_pe} PE",
+                            "Spot_Price": spot_price,
+                            "Risk_Reward": f"{rr_ratio_pe}:1",
                             "RR_Ratio": rr_ratio_pe, "Net_Premium": net_prem_pe,
                             "Short_Delta": delta_pe, "ATR_Moat": moat_atr_pe,
                             "Pass_Delta": pe_wall.get('Pass_Delta', False), 
@@ -165,6 +169,8 @@ class SpreadBuilderEngine:
                     spreads.append({
                         "Symbol": sym, "Strategy": "Iron Condor", "Score": score_ic,
                         "Setup": f"Sell {pe_candidate['short_strike']} PE & {ce_candidate['short_strike']} CE",
+                        "Spot_Price": spot_price,
+                        "Risk_Reward": f"{rr_ratio_ic}:1",
                         "RR_Ratio": rr_ratio_ic, "Net_Premium": total_credit_ic,
                         "Short_Delta": max_abs_delta_ic, "ATR_Moat": worst_moat_ic,
                         "Pass_Delta": bool(max_abs_delta_ic <= 0.15),
