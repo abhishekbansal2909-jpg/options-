@@ -8,7 +8,6 @@ class SpreadBuilderEngine:
 
     @classmethod
     def fetch_lot_sizes(cls):
-        """Silently scrapes live lot sizes from Zerodha's open API instrument dump."""
         if cls._lot_sizes: 
             return cls._lot_sizes
         
@@ -61,18 +60,18 @@ class SpreadBuilderEngine:
                     if net_prem_ce > 0 and max_risk_ce > 0:
                         rr_ratio_ce = round(max_risk_ce / net_prem_ce, 2)
                         
-                        # --- EXTRACT QUANT ENGINE METRICS ---
                         delta_ce = round(ce_wall.get('Delta', 0.0), 3)
                         moat_atr_ce = round(ce_wall.get('Moat_ATR', 0.0), 2)
                         score_ce = ce_wall.get('Composite_Score', 0)
-                        pass_delta_ce = ce_wall.get('Pass_Delta', False)
-                        pass_moat_ce = ce_wall.get('Pass_Moat', False)
+                        
+                        oi_chg_ce = ce_wall.get('OI_Change', 0)
+                        wall_str_ce = "🟢 Reinforced" if oi_chg_ce > 0 else ("🔴 Crumbling" if oi_chg_ce < 0 else "⚪ Neutral")
                         
                         ce_candidate = {
                             "short_strike": short_strike_ce, "long_strike": long_strike_ce,
                             "net_prem": net_prem_ce, "spread_width": spread_width_ce,
                             "safety": round(((short_strike_ce - spot_price) / spot_price) * 100, 2),
-                            "oi_chg": ce_wall.get('OI_Change', 0), "wall_oi": int(ce_wall['OI']),
+                            "oi_chg": oi_chg_ce, "wall_oi": int(ce_wall['OI']),
                             "score": score_ce, "delta": delta_ce, "moat_atr": moat_atr_ce
                         }
                         
@@ -81,10 +80,13 @@ class SpreadBuilderEngine:
                             "Setup": f"Sell {short_strike_ce} CE / Buy {long_strike_ce} CE",
                             "RR_Ratio": rr_ratio_ce, "Net_Premium": net_prem_ce,
                             "Short_Delta": delta_ce, "ATR_Moat": moat_atr_ce,
-                            "Pass_Delta": pass_delta_ce, "Pass_Moat": pass_moat_ce,
+                            "Pass_Delta": ce_wall.get('Pass_Delta', False), 
+                            "Pass_Moat": ce_wall.get('Pass_Moat', False),
                             "Max_Profit_₹": round(net_prem_ce * lot_size, 2),
                             "Max_Risk_₹": round(max_risk_ce * lot_size, 2),
-                            "Lot_Size": lot_size
+                            "Lot_Size": lot_size,
+                            "Wall_Strength": wall_str_ce,
+                            "Wall_OI": int(ce_wall['OI'])
                         })
 
             # ----------------------------------------------------
@@ -109,18 +111,18 @@ class SpreadBuilderEngine:
                     if net_prem_pe > 0 and max_risk_pe > 0:
                         rr_ratio_pe = round(max_risk_pe / net_prem_pe, 2)
                         
-                        # --- EXTRACT QUANT ENGINE METRICS ---
                         delta_pe = round(pe_wall.get('Delta', 0.0), 3)
                         moat_atr_pe = round(pe_wall.get('Moat_ATR', 0.0), 2)
                         score_pe = pe_wall.get('Composite_Score', 0)
-                        pass_delta_pe = pe_wall.get('Pass_Delta', False)
-                        pass_moat_pe = pe_wall.get('Pass_Moat', False)
+                        
+                        oi_chg_pe = pe_wall.get('OI_Change', 0)
+                        wall_str_pe = "🟢 Reinforced" if oi_chg_pe > 0 else ("🔴 Crumbling" if oi_chg_pe < 0 else "⚪ Neutral")
                         
                         pe_candidate = {
                             "short_strike": short_strike_pe, "long_strike": long_strike_pe,
                             "net_prem": net_prem_pe, "spread_width": spread_width_pe,
                             "safety": round(((spot_price - short_strike_pe) / spot_price) * 100, 2),
-                            "oi_chg": pe_wall.get('OI_Change', 0), "wall_oi": int(pe_wall['OI']),
+                            "oi_chg": oi_chg_pe, "wall_oi": int(pe_wall['OI']),
                             "score": score_pe, "delta": delta_pe, "moat_atr": moat_atr_pe
                         }
                         
@@ -129,10 +131,13 @@ class SpreadBuilderEngine:
                             "Setup": f"Sell {short_strike_pe} PE / Buy {long_strike_pe} PE",
                             "RR_Ratio": rr_ratio_pe, "Net_Premium": net_prem_pe,
                             "Short_Delta": delta_pe, "ATR_Moat": moat_atr_pe,
-                            "Pass_Delta": pass_delta_pe, "Pass_Moat": pass_moat_pe,
+                            "Pass_Delta": pe_wall.get('Pass_Delta', False), 
+                            "Pass_Moat": pe_wall.get('Pass_Moat', False),
                             "Max_Profit_₹": round(net_prem_pe * lot_size, 2),
                             "Max_Risk_₹": round(max_risk_pe * lot_size, 2),
-                            "Lot_Size": lot_size
+                            "Lot_Size": lot_size,
+                            "Wall_Strength": wall_str_pe,
+                            "Wall_OI": int(pe_wall['OI'])
                         })
 
             # ----------------------------------------------------
@@ -146,10 +151,16 @@ class SpreadBuilderEngine:
                 if total_credit_ic > 0 and max_risk_ic > 0:
                     rr_ratio_ic = round(max_risk_ic / total_credit_ic, 2)
                     
-                    # Condor takes the lowest score and closest moat of its two wings to reflect maximum risk
                     score_ic = min(ce_candidate['score'], pe_candidate['score'])
                     worst_moat_ic = min(ce_candidate['moat_atr'], pe_candidate['moat_atr'])
                     max_abs_delta_ic = max(abs(ce_candidate['delta']), abs(pe_candidate['delta']))
+                    
+                    if ce_candidate['oi_chg'] > 0 and pe_candidate['oi_chg'] > 0:
+                        wall_str_ic = "🟢 Dual Reinforced"
+                    elif ce_candidate['oi_chg'] < 0 and pe_candidate['oi_chg'] < 0:
+                        wall_str_ic = "🔴 Both Crumbling"
+                    else:
+                        wall_str_ic = "⚪ Mixed Strength"
                     
                     spreads.append({
                         "Symbol": sym, "Strategy": "Iron Condor", "Score": score_ic,
@@ -160,12 +171,13 @@ class SpreadBuilderEngine:
                         "Pass_Moat": bool(ce_candidate['moat_atr'] >= 1.5 and pe_candidate['moat_atr'] >= 1.5),
                         "Max_Profit_₹": round(total_credit_ic * lot_size, 2),
                         "Max_Risk_₹": round(max_risk_ic * lot_size, 2),
-                        "Lot_Size": lot_size
+                        "Lot_Size": lot_size,
+                        "Wall_Strength": wall_str_ic,
+                        "Wall_OI": ce_candidate['wall_oi'] + pe_candidate['wall_oi']
                     })
 
         final_df = pd.DataFrame(spreads)
         if not final_df.empty:
-            # Sort highest Composite Score to the top, then lowest Risk-Reward ratio
             final_df = final_df.sort_values(by=["Score", "RR_Ratio"], ascending=[False, True]).reset_index(drop=True)
             
         return final_df
