@@ -14,43 +14,41 @@ from scipy.stats import norm
 # ==============================================================================
 def download_nse_bhavcopy(date_obj, base_dir="data"):
     """
-    Downloads the F&O and Cash Bhavcopy ZIP files from NSE and extracts them.
+    Downloads the F&O and Cash Bhavcopy ZIP files from NSE (UDiFF Format) and extracts them.
     """
     os.makedirs(base_dir, exist_ok=True)
     
-    # Format dates for NSE URL structure (e.g., 04SEP2026)
-    dd = date_obj.strftime("%d")
-    MMM = date_obj.strftime("%b").upper()
-    yyyy = date_obj.strftime("%Y")
+    # Format dates for the new UDiFF nomenclature (YYYYMMDD)
+    yyyymmdd = date_obj.strftime("%Y%m%d")
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br"
     }
 
+    # Updated URLs for NSE UDiFF Format
     urls = {
-        "cash": f"https://nsearchives.nseindia.com/content/historical/EQUITIES/{yyyy}/{MMM}/cm{dd}{MMM}{yyyy}bhav.csv.zip",
-        "fo": f"https://nsearchives.nseindia.com/content/historical/DERIVATIVES/{yyyy}/{MMM}/fo{dd}{MMM}{yyyy}bhav.csv.zip"
+        "cash": f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip",
+        "fo": f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
     }
     
     file_paths = {}
 
     for market, url in urls.items():
-        print(f"Downloading {market.upper()} Bhavcopy for {dd}-{MMM}-{yyyy}...")
+        print(f"Downloading {market.upper()} UDiFF Bhavcopy for {yyyymmdd}...")
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(base_dir)
-                # The extracted file usually matches the zip name without .zip
                 extracted_file = os.path.join(base_dir, url.split('/')[-1].replace('.zip', ''))
                 file_paths[market] = extracted_file
         else:
             print(f"Failed to download {market} data. Status Code: {response.status_code}")
             return None
             
-        time.sleep(2) # Be polite to the NSE servers
+        time.sleep(2) 
 
     return file_paths
 
@@ -60,6 +58,8 @@ def download_nse_bhavcopy(date_obj, base_dir="data"):
 def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
     """
     Filters out noise, keeps near-month liquid stock options, and merges cash spot price.
+    Note: You may need to map UDiFF column headers (e.g., 'FinInstrmNm' to 'INSTRUMENT') 
+    depending on the exact CSV output.
     """
     df_fo = pd.read_csv(fo_path)
     df_cash = pd.read_csv(cash_path)
@@ -70,7 +70,6 @@ def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
     # Keep only Stock Options
     df = df_fo[df_fo['INSTRUMENT'] == 'OPTSTK'].copy()
     
-    # Calculate Days to Expiry (DTE) - Required for Black-Scholes
     df['EXPIRY_DT'] = pd.to_datetime(df['EXPIRY_DT'])
     current_expiry = df['EXPIRY_DT'].min()
     
@@ -79,20 +78,18 @@ def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
     
     # Calculate DTE (Annualized for IV math)
     dte = (current_expiry - pd.to_datetime(current_date)).days
-    if dte <= 0: dte = 1 / 365 # Prevent division by zero on expiry day
+    if dte <= 0: dte = 1 / 365 
     df['T'] = dte / 365.0 
 
-    # Liquidity Gate: Must have volume and open interest
+    # Liquidity Gate
     df = df[(df['CONTRACTS'] > 0) & (df['OPEN_INT'] > 0)]
 
-    # Prune Columns
     columns_to_keep = [
         'SYMBOL', 'EXPIRY_DT', 'STRIKE_PR', 'OPTION_TYP', 
         'CLOSE', 'CONTRACTS', 'OPEN_INT', 'TIMESTAMP', 'T'
     ]
     df = df[columns_to_keep]
     
-    # Merge Spot Price
     cash_spot = df_cash[['SYMBOL', 'CLOSE']].rename(columns={'CLOSE': 'SPOT_PRICE'})
     df = pd.merge(df, cash_spot, on='SYMBOL', how='left')
     
@@ -103,8 +100,12 @@ def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
         'STRIKE_PR': 'STRIKE'
     }, inplace=True)
     
-    # Drop rows where spot price failed to map
     df.dropna(subset=['SPOT_PRICE'], inplace=True)
+    
+    # CRITICAL FIX: Cast inputs to float for Black-Scholes arrays
+    df['SPOT_PRICE'] = df['SPOT_PRICE'].astype(float)
+    df['STRIKE'] = df['STRIKE'].astype(float)
+    df['OPT_PRICE'] = df['OPT_PRICE'].astype(float)
     
     return df
 
@@ -122,9 +123,7 @@ def calculate_iv_vectorized(df, risk_free_rate=0.07):
     types = df['TYPE'].values
     r = risk_free_rate
 
-    # Initial IV guess
     sigma = np.full(S.shape, 0.30) 
-    
     MAX_ITER = 100
     TOLERANCE = 1e-4
 
@@ -132,23 +131,18 @@ def calculate_iv_vectorized(df, risk_free_rate=0.07):
         d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         
-        # Calculate theoretical price
         call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
         put_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
         
         price_est = np.where(types == 'CE', call_price, put_price)
         
-        # Calculate Vega
         vega = S * norm.pdf(d1) * np.sqrt(T)
-        vega = np.where(vega < 1e-6, 1e-6, vega) # Prevent division by zero
+        vega = np.where(vega < 1e-6, 1e-6, vega) 
         
-        # Newton-Raphson adjustment
         diff = price_est - P
         step = diff / vega
         
         sigma -= step
-        
-        # Ensure volatility doesn't drop below 1%
         sigma = np.maximum(sigma, 0.01)
         
         if np.max(np.abs(diff)) < TOLERANCE:
@@ -165,32 +159,24 @@ def run_daily_ingestion(target_date_str):
     
     date_obj = datetime.strptime(target_date_str, "%d-%b-%Y")
     
-    # Step 1: Download
     file_paths = download_nse_bhavcopy(date_obj)
     if not file_paths:
         print("Pipeline aborted due to download failure.")
         return
 
-    # Step 2: Clean & Merge
     print("Cleaning data and applying liquidity filters...")
     clean_df = clean_bhavcopy_for_db(file_paths['fo'], file_paths['cash'], date_obj)
     
-    # Step 3: Calculate Implied Volatility
     print("Calculating Implied Volatility via Black-Scholes...")
-    final_df = calculate_iv_vectorized(clean_df, risk_free_rate=0.07) # 7% India risk-free proxy
+    final_df = calculate_iv_vectorized(clean_df, risk_free_rate=0.07) 
     
-    # Step 4: Save to Database
     print("Pushing to SQLite database...")
     db_path = "market_data.db"
     conn = sqlite3.connect(db_path)
     
-    # Drop the temporary 'T' column before saving
     final_df.drop(columns=['T'], inplace=True)
-    
-    # Append to table (Creates it if it doesn't exist)
     final_df.to_sql("options_history", conn, if_exists="append", index=False)
     
-    # Create an index on Symbol and Timestamp for lightning-fast queries in Streamlit
     cursor = conn.cursor()
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_time ON options_history(SYMBOL, TIMESTAMP)")
     
@@ -199,10 +185,5 @@ def run_daily_ingestion(target_date_str):
     
     print(f"Success! {len(final_df)} highly liquid contracts processed and safely stored.")
 
-# ==============================================================================
-# EXECUTION BLOCK
-# ==============================================================================
 if __name__ == "__main__":
-    # Example execution (Usually you would pass today's date automatically)
-    # Using last Friday's date for weekend processing:
-    run_daily_ingestion("04-SEP-2026") 
+    run_daily_ingestion("11-SEP-2026")
