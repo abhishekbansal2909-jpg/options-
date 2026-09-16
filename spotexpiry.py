@@ -6,16 +6,53 @@ class SpotAndExpiryEngine:
     """Synchronizes live cash prices, filters active expiries, and calculates market context."""
 
     @staticmethod
-    def filter_front_month_expiry(df: pd.DataFrame) -> pd.DataFrame:
-        """Isolates the nearest active expiry date to ensure high liquidity."""
+    def filter_active_expiries(df: pd.DataFrame, include_next_month: bool = True) -> pd.DataFrame:
+        """
+        Isolates active expiration dates:
+        - If include_next_month is True, keeps both Near (Current) and Next month.
+        - Labels the cycle ('Near' vs 'Next') and calculates DTE.
+        """
         if 'Expiry_Date' not in df.columns or df['Expiry_Date'].isnull().all():
             print("⚠️ Expiry dates missing or invalid. Skipping expiry filter.")
             return df
 
-        active_expiry = df['Expiry_Date'].min()
-        print(f"📅 Locking onto active front-month expiry: {active_expiry.date()}")
+        # Ensure datetime format
+        df['Expiry_Date'] = pd.to_datetime(df['Expiry_Date'])
         
-        return df[df['Expiry_Date'] == active_expiry].copy()
+        # Get sorted list of unique future expiries
+        unique_expiries = sorted(df['Expiry_Date'].dropna().unique())
+
+        if not unique_expiries:
+            print("⚠️ No valid expiry dates found.")
+            return df
+
+        today = pd.Timestamp.today().normalize()
+
+        if include_next_month and len(unique_expiries) >= 2:
+            target_expiries = unique_expiries[:2]
+            near_expiry, next_expiry = target_expiries[0], target_expiries[1]
+            print(f"📅 Retaining Near Month: {near_expiry.date()} & Next Month: {next_expiry.date()}")
+            
+            filtered_df = df[df['Expiry_Date'].isin(target_expiries)].copy()
+            
+            # Map cycle labels
+            cycle_map = {near_expiry: 'Near', next_expiry: 'Next'}
+            filtered_df['Expiry_Cycle'] = filtered_df['Expiry_Date'].map(cycle_map)
+        else:
+            target_expiry = unique_expiries[0]
+            print(f"📅 Locking onto active front-month expiry: {target_expiry.date()}")
+            filtered_df = df[df['Expiry_Date'] == target_expiry].copy()
+            filtered_df['Expiry_Cycle'] = 'Near'
+
+        # Calculate exact Days to Expiry (DTE)
+        filtered_df['DTE'] = (filtered_df['Expiry_Date'] - today).dt.days
+
+        return filtered_df
+
+    @staticmethod
+    def filter_front_month_expiry(df: pd.DataFrame) -> pd.DataFrame:
+        """Legacy wrapper to prevent breaking existing engine calls."""
+        return SpotAndExpiryEngine.filter_active_expiries(df, include_next_month=True)
 
     @staticmethod
     def sync_market_context(df: pd.DataFrame) -> pd.DataFrame:
