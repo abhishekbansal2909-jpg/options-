@@ -67,7 +67,13 @@ st.sidebar.header("1. Data Ingestion")
 bhavcopy_file = st.sidebar.file_uploader("Upload NSE Bhavcopy (ZIP/CSV)", type=['csv', 'zip'])
 participant_file = st.sidebar.file_uploader("Upload Participant OI (CSV)", type=['csv'])
 
-st.sidebar.header("2. Base Strategy Filter")
+st.sidebar.header("2. Base Filters")
+expiry_filter = st.sidebar.radio(
+    "Select Expiry Cycle",
+    options=["Both", "Near", "Next"],
+    index=0
+)
+
 strategy_filter = st.sidebar.multiselect(
     "Select Strategies to Process", 
     options=["Bear Call Spread", "Bull Put Spread", "Iron Condor"],
@@ -102,8 +108,8 @@ if st.sidebar.button("Run Quantitative Scan", type="primary"):
                 ingestion = OptionsDataIngestion(file_path=temp_path)
                 raw_df = ingestion.load_bhavcopy()
                 
-                # 3. Market Context & Syncing
-                active_df = SpotAndExpiryEngine.filter_front_month_expiry(raw_df)
+                # 3. Market Context & Syncing (Updated to pull both expiries)
+                active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
                 synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
                 
                 # Isolate the context for the scoring engine
@@ -152,6 +158,13 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
 
     # Apply filters dynamically to the session state dataframe
     display_df = st.session_state['spreads_df'].copy()
+    
+    # Expiry Filter Toggle
+    if expiry_filter != "Both":
+        # Check if Expiry_Cycle column exists to prevent crashes on older cached data
+        if 'Expiry_Cycle' in display_df.columns:
+            display_df = display_df[display_df["Expiry_Cycle"] == expiry_filter]
+            
     display_df = display_df[display_df["Strategy"].isin(strategy_filter)]
     
     if search_symbol:
@@ -160,30 +173,47 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     display_df = display_df[display_df["Score"] >= min_score]
     display_df = display_df[display_df["Short_Delta"].abs() <= max_delta]
     display_df = display_df[display_df["RR_Ratio"] <= max_rr]
-    display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
+    
+    # Ensure Wall_Strength exists before filtering
+    if 'Wall_Strength' in display_df.columns:
+        display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
     
     st.caption(f"Showing **{len(display_df)}** statistically filtered setups.")
     
-    # Render the advanced quantitative grid
+    # Check available columns to avoid KeyError on older datasets
+    available_cols = display_df.columns.tolist()
+    
+    # Define ideal column order including Expiry and Wall_OI
     cols_to_show = [
-        'Symbol', 'Score', 'Strategy', 'Setup', 'Spot_Price', 
+        'Symbol', 'Expiry_Date', 'DTE', 'Score', 'Strategy', 'Setup', 'Spot_Price', 
         'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
-        'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength'
+        'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI'
     ]
     
+    # Only keep columns that actually exist in the dataframe
+    cols_to_show = [c for c in cols_to_show if c in available_cols]
+    
+    # Format Dictionary
+    format_dict = {
+        'Spot_Price': '₹{:.2f}',
+        'Short_Delta': '{:.3f}',
+        'ATR_Moat': '{:.2f}x',
+        'Net_Premium': '₹{:.2f}',
+        'Max_Profit_₹': '₹{:,.2f}',
+        'Max_Risk_₹': '₹{:,.2f}',
+        'Wall_OI': '{:,}' # Formats contract number with commas
+    }
+    
+    # Only format columns that exist
+    format_dict = {k: v for k, v in format_dict.items() if k in cols_to_show}
+    
+    # Render the advanced quantitative grid
     st.dataframe(
         display_df[cols_to_show].style.background_gradient(
-            subset=['Score', 'ATR_Moat'], cmap='RdYlGn'
+            subset=['Score', 'ATR_Moat'] if 'Score' in cols_to_show else [], cmap='RdYlGn'
         ).background_gradient(
-            subset=['Short_Delta'], cmap='RdYlGn_r'  # Reversed so lower Delta is green
-        ).format({
-            'Spot_Price': '₹{:.2f}',
-            'Short_Delta': '{:.3f}',
-            'ATR_Moat': '{:.2f}x',
-            'Net_Premium': '₹{:.2f}',
-            'Max_Profit_₹': '₹{:,.2f}',
-            'Max_Risk_₹': '₹{:,.2f}',
-        }),
+            subset=['Short_Delta'] if 'Short_Delta' in cols_to_show else [], cmap='RdYlGn_r'  
+        ).format(format_dict),
         use_container_width=True,
         hide_index=True
     )
