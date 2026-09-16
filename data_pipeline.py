@@ -57,7 +57,7 @@ def download_nse_bhavcopy(date_obj, base_dir="data"):
 # ==============================================================================
 def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
     """
-    Filters out noise, keeps near-month liquid stock options, and merges cash spot price.
+    Filters out noise, keeps Near-Month & Next-Month liquid stock options, and merges cash spot price.
     Note: You may need to map UDiFF column headers (e.g., 'FinInstrmNm' to 'INSTRUMENT') 
     depending on the exact CSV output.
     """
@@ -71,15 +71,20 @@ def clean_bhavcopy_for_db(fo_path, cash_path, current_date):
     df = df_fo[df_fo['INSTRUMENT'] == 'OPTSTK'].copy()
     
     df['EXPIRY_DT'] = pd.to_datetime(df['EXPIRY_DT'])
-    current_expiry = df['EXPIRY_DT'].min()
     
-    # Isolate Near-Month Options
-    df = df[df['EXPIRY_DT'] == current_expiry]
+    # CRITICAL FIX: Isolate the TWO nearest expiries (Near & Next Month)
+    unique_expiries = sorted(df['EXPIRY_DT'].dropna().unique())
+    if len(unique_expiries) >= 2:
+        target_expiries = unique_expiries[:2]
+        df = df[df['EXPIRY_DT'].isin(target_expiries)].copy()
+    else:
+        # Fallback if only one expiry exists in the file
+        df = df[df['EXPIRY_DT'] == unique_expiries[0]].copy()
     
-    # Calculate DTE (Annualized for IV math)
-    dte = (current_expiry - pd.to_datetime(current_date)).days
-    if dte <= 0: dte = 1 / 365 
-    df['T'] = dte / 365.0 
+    # Calculate DTE (Annualized for IV math) dynamically per row
+    df['DTE_DAYS'] = (df['EXPIRY_DT'] - pd.to_datetime(current_date)).dt.days
+    df['DTE_DAYS'] = df['DTE_DAYS'].apply(lambda x: 1 if x <= 0 else x)
+    df['T'] = df['DTE_DAYS'] / 365.0 
 
     # Liquidity Gate
     df = df[(df['CONTRACTS'] > 0) & (df['OPEN_INT'] > 0)]
@@ -186,4 +191,4 @@ def run_daily_ingestion(target_date_str):
     print(f"Success! {len(final_df)} highly liquid contracts processed and safely stored.")
 
 if __name__ == "__main__":
-    run_daily_ingestion("11-SEP-2026")
+    run_daily_ingestion("16-SEP-2026")
