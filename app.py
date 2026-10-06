@@ -81,58 +81,72 @@ strategy_filter = st.sidebar.multiselect(
 )
 
 # ==========================================
-# Core Execution Engine
+# Core Execution Engine (Cached)
 # ==========================================
+@st.cache_data(show_spinner=False)
+def run_quant_pipeline(bhavcopy_bytes, participant_bytes):
+    """Caches the heavy yfinance network calls and Black-Scholes math in server RAM."""
+    temp_path = "temp_bhavcopy.csv"
+    temp_part_path = "temp_participant.csv" if participant_bytes else None
+    
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(bhavcopy_bytes)
+        if temp_part_path:
+            with open(temp_part_path, "wb") as f:
+                f.write(participant_bytes)
+                
+        # 1. Macro Tide
+        tide_info = None
+        if temp_part_path:
+            tide_status, tide_ratio = get_fii_tide(temp_part_path)
+            tide_info = f"**MACRO TIDE:** {tide_status} | **FII Long Ratio:** {tide_ratio}%"
+
+        # 2. Bhavcopy Extraction & Normalization
+        ingestion = OptionsDataIngestion(file_path=temp_path)
+        raw_df = ingestion.load_bhavcopy()
+        
+        # 3. Market Context & Syncing 
+        active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
+        synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
+        
+        market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
+        available_context = [c for c in market_context_cols if c in synced_df.columns]
+        market_context_df = synced_df[available_context].drop_duplicates()
+        
+        # 4. Glass-Box Scoring Engine 
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        quant_engine = QuantitativeScoringEngine(active_df, market_context_df)
+        scored_df = quant_engine.run_glass_box_pipeline(current_date_str)
+        
+        # 5. Build Spreads
+        spreads_df = SpreadBuilderEngine.build_spreads(scored_df)
+        return spreads_df, tide_info
+        
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if temp_part_path and os.path.exists(temp_part_path):
+            os.remove(temp_part_path)
+
 if st.sidebar.button("Run Quantitative Scan", type="primary"):
     if bhavcopy_file is None:
         st.sidebar.error("⚠️ Please upload a Bhavcopy file to proceed.")
     else:
-        with st.spinner("Initializing Quantitative Engine & Calculating Greeks..."):
-            temp_path = None
-            temp_part_path = None
+        with st.spinner("Initializing Quantitative Engine, Fetching EMAs & Calculating Greeks..."):
             try:
-                # 1. Macro Tide
-                if participant_file is not None:
-                    temp_part_path = f"temp_{participant_file.name}"
-                    with open(temp_part_path, "wb") as f:
-                        f.write(participant_file.getbuffer())
+                bhav_bytes = bhavcopy_file.getvalue()
+                part_bytes = participant_file.getvalue() if participant_file else None
+                
+                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, part_bytes)
+                
+                if tide_info:
+                    st.info(tide_info)
                     
-                    tide_status, tide_ratio = get_fii_tide(temp_part_path)
-                    st.info(f"**MACRO TIDE:** {tide_status} | **FII Long Ratio:** {tide_ratio}%")
-
-                # 2. Bhavcopy Extraction & Normalization
-                temp_path = f"temp_{bhavcopy_file.name}"
-                with open(temp_path, "wb") as f:
-                    f.write(bhavcopy_file.getbuffer())
-                    
-                ingestion = OptionsDataIngestion(file_path=temp_path)
-                raw_df = ingestion.load_bhavcopy()
-                
-                # 3. Market Context & Syncing 
-                active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
-                synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
-                
-                # Isolate context including EMA metrics for scoring
-                market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
-                available_context = [c for c in market_context_cols if c in synced_df.columns]
-                market_context_df = synced_df[available_context].drop_duplicates()
-                
-                # 4. Glass-Box Scoring Engine 
-                current_date_str = datetime.now().strftime("%Y-%m-%d")
-                quant_engine = QuantitativeScoringEngine(active_df, market_context_df)
-                scored_df = quant_engine.run_glass_box_pipeline(current_date_str)
-                
-                # 5. Build Spreads
-                st.session_state['spreads_df'] = SpreadBuilderEngine.build_spreads(scored_df)
+                st.session_state['spreads_df'] = spreads_df
                 st.success("✅ Engine computation complete. Displaying full algorithmic state.")
-                    
             except Exception as e:
                 st.error(f"Pipeline Error: {str(e)}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-                if temp_part_path and os.path.exists(temp_part_path):
-                    os.remove(temp_part_path)
 
 # ==========================================
 # Dynamic Grid Filters (Glass-Box UI)
