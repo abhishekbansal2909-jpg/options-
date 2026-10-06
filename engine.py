@@ -11,8 +11,9 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 class OptionsDataIngestion:
     """Handles discovery, unzipping, normalization, and filtering of NSE F&O Bhavcopy data."""
 
-    def __init__(self, file_path=None):
+    def __init__(self, file_path=None, max_symbols=None):
         self.file_path = file_path or self._locate_bhavcopy()
+        self.max_symbols = max_symbols
 
     def _locate_bhavcopy(self) -> str | None:
         patterns = [
@@ -37,10 +38,8 @@ class OptionsDataIngestion:
         else:
             df = pd.read_csv(self.file_path, low_memory=False)
 
-        # Standardize headers by removing spaces and underscores
         df.columns = df.columns.astype(str).str.strip().str.upper().str.replace("_", "").str.replace(" ", "")
 
-        # Map known UDiFF & legacy variations
         column_map = {
             "TCKRSYMB": "Symbol", "TRADGSYMB": "Symbol", "UNDRLNGST": "Symbol", "SYMBOL": "Symbol",
             "OPTNTP": "Option_Type", "OPTIONTYP": "Option_Type", "OPTIONTYPE": "Option_Type",
@@ -93,6 +92,11 @@ class OptionsDataIngestion:
 
         df = df.dropna(subset=["Symbol", "Option_Type", "Strike"])
         
+        # QUANTITATIVE LIQUIDITY FILTER (Drastically reduces memory & API overhead)
+        if self.max_symbols:
+            top_syms = df.groupby('Symbol')['OI'].sum().nlargest(self.max_symbols).index
+            df = df[df['Symbol'].isin(top_syms)]
+        
         return df[['Symbol', 'Expiry_Date', 'Option_Type', 'Strike', 'LTP', 'OI', 'OI_Change']]
 
 
@@ -123,45 +127,53 @@ class QuantitativeScoringEngine:
         # 1. Merge Spot, ATR, Beta, Event data from the UI stream
         self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
         
-        # 2. STATELESS CLOUD FIX: Calculate EMA on the fly via yfinance
+        # 2. STATELESS CLOUD FIX (Render Optimized): Chunked sequential fetching
         if 'EMA_20' not in self.df.columns or self.df['EMA_20'].isna().all():
             try:
                 import yfinance as yf
                 import warnings
-                warnings.filterwarnings('ignore') # Suppress yf warnings
+                warnings.filterwarnings('ignore')
                 
-                # Format NSE symbols for Yahoo Finance (e.g., RELIANCE.NS)
                 symbols = self.df['Symbol'].unique().tolist()
-                yf_tickers = " ".join([f"{sym}.NS" for sym in symbols])
+                ema_dict = {}
                 
-                # Fetch last 40 days of closing prices in one batch
-                data = yf.download(
-                    yf_tickers, 
-                    period="2mo", 
-                    progress=False, 
-                    threads=True, 
-                    timeout=10
-                )
-                
-                if 'Close' in data:
-                    closes = data['Close']
-                    ema_dict = {}
+                # Fast sequential fetching for the filtered liquidity universe
+                chunk_size = 40
+                for i in range(0, len(symbols), chunk_size):
+                    chunk = symbols[i:i + chunk_size]
+                    yf_tickers = " ".join([f"{sym}.NS" for sym in chunk])
                     
-                    for sym in symbols:
-                        yf_sym = f"{sym}.NS"
-                        if yf_sym in closes:
-                            ticker_closes = closes[yf_sym].dropna()
+                    data = yf.download(
+                        yf_tickers, 
+                        period="2mo", 
+                        progress=False, 
+                        threads=False, 
+                        timeout=15
+                    )
+                    
+                    if 'Close' in data:
+                        closes = data['Close']
+                        for sym in chunk:
+                            yf_sym = f"{sym}.NS"
+                            
+                            if isinstance(closes, pd.DataFrame):
+                                if yf_sym in closes.columns:
+                                    ticker_closes = closes[yf_sym].dropna()
+                                else:
+                                    continue
+                            else:
+                                ticker_closes = closes.dropna()
+                                
                             if not ticker_closes.empty:
-                                # Calculate 20 EMA and grab the latest value
                                 ema_20 = ticker_closes.ewm(span=20, adjust=False).mean().iloc[-1]
                                 ema_dict[sym] = round(ema_20, 2)
                                 
-                    self.df['EMA_20'] = self.df['Symbol'].map(ema_dict)
-                    self.df['EMA_DIST_PCT'] = np.round(((self.df['Spot_Price'] - self.df['EMA_20']) / self.df['EMA_20']) * 100, 2)
+                self.df['EMA_20'] = self.df['Symbol'].map(ema_dict)
+                self.df['EMA_DIST_PCT'] = np.round(((self.df['Spot_Price'] - self.df['EMA_20']) / self.df['EMA_20']) * 100, 2)
             except Exception as e:
                 print(f"Cloud EMA Fetch Failed: {e}")
 
-        # 3. Graceful fallback for missing tickers or failed fetches
+        # 3. Graceful fallback for missing tickers
         if 'EMA_20' not in self.df.columns:
             self.df['EMA_20'] = self.df['Spot_Price']
             self.df['EMA_DIST_PCT'] = 0.0
@@ -172,7 +184,6 @@ class QuantitativeScoringEngine:
         self.df.dropna(subset=['Spot_Price', 'EMA_20'], inplace=True)
 
     def _detect_institutional_walls(self):
-        # Find the strikes with the maximum Open Interest (The Iron Condor boundaries)
         idx_call_wall = self.df[self.df['Option_Type'] == 'CE'].groupby('Symbol')['OI'].idxmax()
         idx_put_wall = self.df[self.df['Option_Type'] == 'PE'].groupby('Symbol')['OI'].idxmax()
 
@@ -182,7 +193,6 @@ class QuantitativeScoringEngine:
         self.df = pd.merge(self.df, call_walls, on='Symbol', how='left')
         self.df = pd.merge(self.df, put_walls, on='Symbol', how='left')
 
-        # Allow the 20-Day EMA to act as a valid institutional wall for Calls in a net-short tape
         self.df['Outside_Inst_Wall'] = np.where(
             self.df['Option_Type'] == 'CE',
             (self.df['Strike'] >= self.df['Call_Wall']) | (self.df['Strike'] >= self.df['EMA_20']),
@@ -190,13 +200,11 @@ class QuantitativeScoringEngine:
         )
 
     def _compute_moats(self):
-        # Calculate raw percentage distance and ATR multiples
         distance = np.abs(self.df['Strike'] - self.df['Spot_Price'])
         
         self.df['Moat_Percent'] = (distance / self.df['Spot_Price']) * 100
         self.df['Moat_ATR'] = distance / self.df['ATR_14']
 
-        # Beta adjusted safety rules
         self.df['Pass_Moat'] = np.where(
             self.df['Beta'] > 1.2,
             (self.df['Moat_Percent'] >= 7.0) & (self.df['Moat_ATR'] >= 2.0),
@@ -222,7 +230,6 @@ class QuantitativeScoringEngine:
         
         self.df['Delta'] = np.where(self.df['Option_Type'] == 'CE', call_delta, put_delta)
         
-        # Widen Delta allowance specifically for Bear Call regimes (up to 0.20)
         self.df['Pass_Delta'] = np.where(
             self.df['Option_Type'] == 'CE',
             np.abs(self.df['Delta']) <= 0.20,
@@ -232,24 +239,20 @@ class QuantitativeScoringEngine:
     def _generate_composite_score(self):
         self.df['Pass_Event'] = self.df['Days_To_Event'] > 14
         
-        # Determine Regime Alignment
         self.df['Regime_Aligned'] = np.where(
             self.df['Option_Type'] == 'CE',
             self.df['Spot_Price'] < self.df['EMA_20'],
             self.df['Spot_Price'] > self.df['EMA_20']
         )
         
-        # Flag if data is missing (Spot exactly equals EMA fallback)
         self.df['Missing_EMA'] = self.df['Spot_Price'] == self.df['EMA_20']
         
-        # Base Score (0 to 100)
         score = np.zeros(len(self.df))
         score += np.where(self.df['Pass_Delta'], 25, 0)
         score += np.where(self.df['Pass_Moat'], 25, 0)
         score += np.where(self.df['Outside_Inst_Wall'], 20, 0)
         score += np.where(self.df['Pass_Event'], 15, 0)
         
-        # Apply +15 for Aligned, 0 for Missing Data, -40 for Counter-Trend
         score += np.where(
             self.df['Regime_Aligned'], 15, 
             np.where(self.df['Missing_EMA'], 0, -40)
