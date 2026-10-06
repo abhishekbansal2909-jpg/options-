@@ -1,3 +1,4 @@
+
 import glob
 import os
 import re
@@ -10,6 +11,7 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 
 class OptionsDataIngestion:
     """Handles discovery, unzipping, normalization, and filtering of NSE F&O Bhavcopy data."""
+    # (Keep your existing __init__, _locate_bhavcopy, and load_bhavcopy methods exactly as they are)
 
     def __init__(self, file_path=None):
         self.file_path = file_path or self._locate_bhavcopy()
@@ -103,7 +105,8 @@ class QuantitativeScoringEngine:
     """
     def __init__(self, options_df, market_data_df, risk_free_rate=0.07):
         """
-        market_data_df requires columns: ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event']
+        market_data_df requires columns: 
+        ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
         """
         self.df = options_df.copy()
         self.market_data = market_data_df
@@ -118,9 +121,9 @@ class QuantitativeScoringEngine:
         return self.df
 
     def _merge_market_context(self):
-        # Merge spot price, ATR, Beta, and Event data to the options chain
+        # Merge spot price, ATR, Beta, Event data, and newly calculated EMA metrics
         self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
-        self.df.dropna(subset=['Spot_Price'], inplace=True)
+        self.df.dropna(subset=['Spot_Price', 'EMA_20'], inplace=True)
 
     def _detect_institutional_walls(self):
         # Find the strikes with the maximum Open Interest (The Iron Condor boundaries)
@@ -133,10 +136,10 @@ class QuantitativeScoringEngine:
         self.df = pd.merge(self.df, call_walls, on='Symbol', how='left')
         self.df = pd.merge(self.df, put_walls, on='Symbol', how='left')
 
-        # Flag if the short strike is mathematically outside the institutional battleground
+        # Allow the 20-Day EMA to act as a valid institutional wall for Calls in a net-short tape
         self.df['Outside_Inst_Wall'] = np.where(
             self.df['Option_Type'] == 'CE',
-            self.df['Strike'] >= self.df['Call_Wall'],
+            (self.df['Strike'] >= self.df['Call_Wall']) | (self.df['Strike'] >= self.df['EMA_20']),
             self.df['Strike'] <= self.df['Put_Wall']
         )
 
@@ -155,10 +158,8 @@ class QuantitativeScoringEngine:
         )
 
     def _compute_delta(self, current_date):
-        # Vectorized Black-Scholes Delta (using a simplified fixed IV assumption if IV is not pre-calculated)
-        # Ideally, IV should be passed in from your data_pipeline.py
         if 'IV' not in self.df.columns:
-            self.df['IV'] = 0.30 # Placeholder if true IV is missing
+            self.df['IV'] = 0.30 
             
         dte = (pd.to_datetime(self.df['Expiry_Date']) - pd.to_datetime(current_date)).dt.days
         dte = np.where(dte <= 0, 1, dte)
@@ -175,18 +176,29 @@ class QuantitativeScoringEngine:
         
         self.df['Delta'] = np.where(self.df['Option_Type'] == 'CE', call_delta, put_delta)
         
-        # Absolute Delta Check (<= 0.15)
-        self.df['Pass_Delta'] = np.abs(self.df['Delta']) <= 0.15
+        # Widen Delta allowance specifically for Bear Call regimes (up to 0.20)
+        self.df['Pass_Delta'] = np.where(
+            self.df['Option_Type'] == 'CE',
+            np.abs(self.df['Delta']) <= 0.20,
+            np.abs(self.df['Delta']) <= 0.13
+        )
 
     def _generate_composite_score(self):
-        # Event exclusion toggle
         self.df['Pass_Event'] = self.df['Days_To_Event'] > 14
         
-        # Build the final Composite Score (0 to 100)
+        # Determine Regime Alignment mathematically
+        self.df['Regime_Aligned'] = np.where(
+            self.df['Option_Type'] == 'CE',
+            self.df['Spot_Price'] < self.df['EMA_20'],
+            self.df['Spot_Price'] > self.df['EMA_20']
+        )
+        
+        # Base Score (0 to 100)
         score = np.zeros(len(self.df))
-        score += np.where(self.df['Pass_Delta'], 30, 0)
-        score += np.where(self.df['Pass_Moat'], 30, 0)
+        score += np.where(self.df['Pass_Delta'], 25, 0)
+        score += np.where(self.df['Pass_Moat'], 25, 0)
         score += np.where(self.df['Outside_Inst_Wall'], 20, 0)
-        score += np.where(self.df['Pass_Event'], 20, 0)
+        score += np.where(self.df['Pass_Event'], 15, 0)
+        score += np.where(self.df['Regime_Aligned'], 15, -40) # Harsh penalty, but not dropped
         
         self.df['Composite_Score'] = score
