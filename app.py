@@ -108,21 +108,23 @@ if st.sidebar.button("Run Quantitative Scan", type="primary"):
                 ingestion = OptionsDataIngestion(file_path=temp_path)
                 raw_df = ingestion.load_bhavcopy()
                 
-                # 3. Market Context & Syncing (Updated to pull both expiries)
+                # 3. Market Context & Syncing 
                 active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
                 synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
                 
-                # Isolate the context for the scoring engine
-                market_context_df = synced_df[['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event']].drop_duplicates()
+                # Isolate context including EMA metrics for scoring
+                market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
+                available_context = [c for c in market_context_cols if c in synced_df.columns]
+                market_context_df = synced_df[available_context].drop_duplicates()
                 
-                # 4. Glass-Box Scoring Engine (Delta, ATR Moats, Institutional Walls)
+                # 4. Glass-Box Scoring Engine 
                 current_date_str = datetime.now().strftime("%Y-%m-%d")
                 quant_engine = QuantitativeScoringEngine(active_df, market_context_df)
                 scored_df = quant_engine.run_glass_box_pipeline(current_date_str)
                 
                 # 5. Build Spreads
                 st.session_state['spreads_df'] = SpreadBuilderEngine.build_spreads(scored_df)
-                st.success("✅ Engine computation complete. Displaying algorithmic rankings.")
+                st.success("✅ Engine computation complete. Displaying full algorithmic state.")
                     
             except Exception as e:
                 st.error(f"Pipeline Error: {str(e)}")
@@ -144,11 +146,15 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     with col1:
         search_symbol = st.text_input("Search Symbol", placeholder="e.g., RELIANCE")
     with col2:
-        min_score = st.number_input("Min Composite Score", min_value=0, max_value=100, value=50, step=10)
+        regime_filter = st.multiselect(
+            "Regime Alignment", 
+            options=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"],
+            default=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"]
+        )
     with col3:
-        max_delta = st.number_input("Max Short Delta", min_value=0.01, max_value=1.00, value=0.15, step=0.01)
+        min_score = st.number_input("Min Composite Score", min_value=-50, max_value=100, value=0, step=10)
     with col4:
-        max_rr = st.number_input("Max Risk:Reward Ratio", min_value=0.1, max_value=50.0, value=25.0, step=0.5)
+        max_delta = st.number_input("Max Short Delta", min_value=0.01, max_value=1.00, value=0.20, step=0.01)
     with col5:
         wall_filter = st.multiselect(
             "Wall Strength", 
@@ -156,14 +162,11 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
             default=["🟢 Reinforced", "🟢 Dual Reinforced", "⚪ Neutral", "⚪ Mixed Strength"]
         )
 
-    # Apply filters dynamically to the session state dataframe
+    # Apply filters dynamically 
     display_df = st.session_state['spreads_df'].copy()
     
-    # Expiry Filter Toggle
-    if expiry_filter != "Both":
-        # Check if Expiry_Cycle column exists to prevent crashes on older cached data
-        if 'Expiry_Cycle' in display_df.columns:
-            display_df = display_df[display_df["Expiry_Cycle"] == expiry_filter]
+    if expiry_filter != "Both" and 'Expiry_Cycle' in display_df.columns:
+        display_df = display_df[display_df["Expiry_Cycle"] == expiry_filter]
             
     display_df = display_df[display_df["Strategy"].isin(strategy_filter)]
     
@@ -172,45 +175,45 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         
     display_df = display_df[display_df["Score"] >= min_score]
     display_df = display_df[display_df["Short_Delta"].abs() <= max_delta]
-    display_df = display_df[display_df["RR_Ratio"] <= max_rr]
     
-    # Ensure Wall_Strength exists before filtering
+    if 'Regime' in display_df.columns:
+        display_df = display_df[display_df["Regime"].isin(regime_filter)]
+        
     if 'Wall_Strength' in display_df.columns:
         display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
     
-    st.caption(f"Showing **{len(display_df)}** statistically filtered setups.")
+    st.caption(f"Showing **{len(display_df)}** setups (Counter-trend setups are visible but scored down).")
     
-    # Check available columns to avoid KeyError on older datasets
     available_cols = display_df.columns.tolist()
     
-    # Define ideal column order including Expiry and Wall_OI
+    # Updated column order exposing the new Glass Engine metrics
     cols_to_show = [
-        'Symbol', 'Expiry_Date', 'DTE', 'Score', 'Strategy', 'Setup', 'Spot_Price', 
-        'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
-        'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI'
+        'Symbol', 'Regime', 'Score', 'Strategy', 'Setup', 'Spot_Price', 'EMA_20', 'EMA_Dist_%',
+        'Expiry_Date', 'DTE', 'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
+        'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI', 'L2_Execution_Risk'
     ]
     
-    # Only keep columns that actually exist in the dataframe
     cols_to_show = [c for c in cols_to_show if c in available_cols]
     
-    # Format Dictionary
     format_dict = {
         'Spot_Price': '₹{:.2f}',
+        'EMA_20': '₹{:.2f}',
+        'EMA_Dist_%': '{:.2f}%',
         'Short_Delta': '{:.3f}',
         'ATR_Moat': '{:.2f}x',
         'Net_Premium': '₹{:.2f}',
         'Max_Profit_₹': '₹{:,.2f}',
         'Max_Risk_₹': '₹{:,.2f}',
-        'Wall_OI': '{:,}' # Formats contract number with commas
+        'Wall_OI': '{:,}' 
     }
     
-    # Only format columns that exist
     format_dict = {k: v for k, v in format_dict.items() if k in cols_to_show}
     
-    # Render the advanced quantitative grid
     st.dataframe(
         display_df[cols_to_show].style.background_gradient(
-            subset=['Score', 'ATR_Moat'] if 'Score' in cols_to_show else [], cmap='RdYlGn'
+            subset=['Score'] if 'Score' in cols_to_show else [], cmap='RdYlGn', vmin=0, vmax=100
+        ).background_gradient(
+            subset=['ATR_Moat'] if 'ATR_Moat' in cols_to_show else [], cmap='RdYlGn'
         ).background_gradient(
             subset=['Short_Delta'] if 'Short_Delta' in cols_to_show else [], cmap='RdYlGn_r'  
         ).format(format_dict),
