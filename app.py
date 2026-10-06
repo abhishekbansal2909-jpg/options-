@@ -84,9 +84,10 @@ strategy_filter = st.sidebar.multiselect(
 # Core Execution Engine (Cached)
 # ==========================================
 @st.cache_data(show_spinner=False)
-def run_quant_pipeline(bhavcopy_bytes, participant_bytes):
+def run_quant_pipeline(bhavcopy_bytes, bhavcopy_name, participant_bytes):
     """Caches the heavy yfinance network calls and Black-Scholes math in server RAM."""
-    temp_path = "temp_bhavcopy.csv"
+    # PRESERVE THE ZIP/CSV EXTENSION
+    temp_path = f"temp_{bhavcopy_name}"
     temp_part_path = "temp_participant.csv" if participant_bytes else None
     
     try:
@@ -136,9 +137,10 @@ if st.sidebar.button("Run Quantitative Scan", type="primary"):
         with st.spinner("Initializing Quantitative Engine, Fetching EMAs & Calculating Greeks..."):
             try:
                 bhav_bytes = bhavcopy_file.getvalue()
+                bhav_name = bhavcopy_file.name
                 part_bytes = participant_file.getvalue() if participant_file else None
                 
-                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, part_bytes)
+                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, bhav_name, part_bytes)
                 
                 if tide_info:
                     st.info(tide_info)
@@ -163,10 +165,10 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         regime_filter = st.multiselect(
             "Regime Alignment", 
             options=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"],
-            default=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"]
+            default=["🟢 Trend Aligned", "🟢 Range Bound"] # Changed default to hide bad trends initially
         )
     with col3:
-        min_score = st.number_input("Min Composite Score", min_value=-50, max_value=100, value=0, step=10)
+        min_score = st.number_input("Min Composite Score", min_value=-50, max_value=100, value=50, step=10)
     with col4:
         max_delta = st.number_input("Max Short Delta", min_value=0.01, max_value=1.00, value=0.20, step=0.01)
     with col5:
@@ -196,7 +198,7 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     if 'Wall_Strength' in display_df.columns:
         display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
     
-    st.caption(f"Showing **{len(display_df)}** setups (Counter-trend setups are visible but scored down).")
+    st.caption(f"Showing **{len(display_df)}** statistically filtered setups.")
     
     available_cols = display_df.columns.tolist()
     
