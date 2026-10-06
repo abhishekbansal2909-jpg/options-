@@ -31,14 +31,12 @@ class SpreadBuilderEngine:
         lot_dict = SpreadBuilderEngine.fetch_lot_sizes()
         spreads = []
         
-        # Ensure Expiry_Date exists to avoid KeyError if pipeline is missing data
         if 'Expiry_Date' not in df.columns:
             print("⚠️ Expiry_Date missing from data. Defaulting to single-cycle grouping.")
             df['Expiry_Date'] = 'Unknown'
             df['Expiry_Cycle'] = 'Near'
             df['DTE'] = 0
 
-        # CRITICAL UPDATE: Group by both Symbol AND Expiry_Date to prevent cross-month contamination
         for (sym, expiry_date), group in df.groupby(["Symbol", "Expiry_Date"]):
             spot_price = group['Spot_Price'].iloc[0]
             lot_size = lot_dict.get(sym, 1) 
@@ -47,6 +45,10 @@ class SpreadBuilderEngine:
             expiry_str = expiry_date.strftime('%Y-%m-%d') if isinstance(expiry_date, pd.Timestamp) else str(expiry_date)
             cycle = group.get('Expiry_Cycle', pd.Series(['Unknown'])).iloc[0]
             dte = group.get('DTE', pd.Series([0])).iloc[0]
+            
+            # Extract Glass Engine Trend Metrics
+            ema_20 = group.get('EMA_20', pd.Series([spot_price])).iloc[0]
+            ema_dist_pct = group.get('EMA_DIST_PCT', pd.Series([0.0])).iloc[0]
             
             ce_candidate = None
             pe_candidate = None
@@ -72,13 +74,16 @@ class SpreadBuilderEngine:
                     
                     if net_prem_ce > 0 and max_risk_ce > 0:
                         rr_ratio_ce = round(max_risk_ce / net_prem_ce, 2)
-                        
                         delta_ce = round(ce_wall.get('Delta', 0.0), 3)
                         moat_atr_ce = round(ce_wall.get('Moat_ATR', 0.0), 2)
                         score_ce = ce_wall.get('Composite_Score', 0)
                         
                         oi_chg_ce = ce_wall.get('OI_Change', 0)
                         wall_str_ce = "🟢 Reinforced" if oi_chg_ce > 0 else ("🔴 Crumbling" if oi_chg_ce < 0 else "⚪ Neutral")
+                        
+                        # Regime Evaluation & Delta Calibration
+                        regime_ce = "🟢 Trend Aligned" if spot_price < ema_20 else "🔴 Counter-Trend"
+                        pass_delta_ce = bool(0.10 <= abs(delta_ce) <= 0.20) # Widened band for Bear Calls
                         
                         ce_candidate = {
                             "short_strike": short_strike_ce, "long_strike": long_strike_ce,
@@ -90,19 +95,21 @@ class SpreadBuilderEngine:
                         
                         spreads.append({
                             "Symbol": sym, "Strategy": "Bear Call Spread", "Score": score_ce,
+                            "Regime": regime_ce, "EMA_20": ema_20, "EMA_Dist_%": ema_dist_pct,
                             "Expiry_Date": expiry_str, "Expiry_Cycle": cycle, "DTE": int(dte),
                             "Setup": f"Sell {short_strike_ce} CE / Buy {long_strike_ce} CE",
                             "Spot_Price": spot_price,
                             "Risk_Reward": f"{rr_ratio_ce}:1",
                             "RR_Ratio": rr_ratio_ce, "Net_Premium": net_prem_ce,
                             "Short_Delta": delta_ce, "ATR_Moat": moat_atr_ce,
-                            "Pass_Delta": ce_wall.get('Pass_Delta', False), 
+                            "Pass_Delta": pass_delta_ce, 
                             "Pass_Moat": ce_wall.get('Pass_Moat', False),
                             "Max_Profit_₹": round(net_prem_ce * lot_size, 2),
                             "Max_Risk_₹": round(max_risk_ce * lot_size, 2),
                             "Lot_Size": lot_size,
                             "Wall_Strength": wall_str_ce,
-                            "Wall_OI": int(ce_wall['OI'])
+                            "Wall_OI": int(ce_wall['OI']),
+                            "L2_Execution_Risk": "Awaiting L2 Check"
                         })
 
             # ----------------------------------------------------
@@ -126,13 +133,16 @@ class SpreadBuilderEngine:
                     
                     if net_prem_pe > 0 and max_risk_pe > 0:
                         rr_ratio_pe = round(max_risk_pe / net_prem_pe, 2)
-                        
                         delta_pe = round(pe_wall.get('Delta', 0.0), 3)
                         moat_atr_pe = round(pe_wall.get('Moat_ATR', 0.0), 2)
                         score_pe = pe_wall.get('Composite_Score', 0)
                         
                         oi_chg_pe = pe_wall.get('OI_Change', 0)
                         wall_str_pe = "🟢 Reinforced" if oi_chg_pe > 0 else ("🔴 Crumbling" if oi_chg_pe < 0 else "⚪ Neutral")
+                        
+                        # Regime Evaluation & Delta Calibration
+                        regime_pe = "🟢 Trend Aligned" if spot_price > ema_20 else "🔴 Counter-Trend"
+                        pass_delta_pe = bool(0.10 <= abs(delta_pe) <= 0.13) # Strict band for Bull Puts
                         
                         pe_candidate = {
                             "short_strike": short_strike_pe, "long_strike": long_strike_pe,
@@ -144,19 +154,21 @@ class SpreadBuilderEngine:
                         
                         spreads.append({
                             "Symbol": sym, "Strategy": "Bull Put Spread", "Score": score_pe,
+                            "Regime": regime_pe, "EMA_20": ema_20, "EMA_Dist_%": ema_dist_pct,
                             "Expiry_Date": expiry_str, "Expiry_Cycle": cycle, "DTE": int(dte),
                             "Setup": f"Sell {short_strike_pe} PE / Buy {long_strike_pe} PE",
                             "Spot_Price": spot_price,
                             "Risk_Reward": f"{rr_ratio_pe}:1",
                             "RR_Ratio": rr_ratio_pe, "Net_Premium": net_prem_pe,
                             "Short_Delta": delta_pe, "ATR_Moat": moat_atr_pe,
-                            "Pass_Delta": pe_wall.get('Pass_Delta', False), 
+                            "Pass_Delta": pass_delta_pe, 
                             "Pass_Moat": pe_wall.get('Pass_Moat', False),
                             "Max_Profit_₹": round(net_prem_pe * lot_size, 2),
                             "Max_Risk_₹": round(max_risk_pe * lot_size, 2),
                             "Lot_Size": lot_size,
                             "Wall_Strength": wall_str_pe,
-                            "Wall_OI": int(pe_wall['OI'])
+                            "Wall_OI": int(pe_wall['OI']),
+                            "L2_Execution_Risk": "Awaiting L2 Check"
                         })
 
             # ----------------------------------------------------
@@ -180,22 +192,27 @@ class SpreadBuilderEngine:
                         wall_str_ic = "🔴 Both Crumbling"
                     else:
                         wall_str_ic = "⚪ Mixed Strength"
+                        
+                    # Iron Condor Regime (Requires tight consolidation)
+                    regime_ic = "🟢 Range Bound" if abs(ema_dist_pct) <= 1.5 else "🔴 Expanding"
                     
                     spreads.append({
                         "Symbol": sym, "Strategy": "Iron Condor", "Score": score_ic,
+                        "Regime": regime_ic, "EMA_20": ema_20, "EMA_Dist_%": ema_dist_pct,
                         "Expiry_Date": expiry_str, "Expiry_Cycle": cycle, "DTE": int(dte),
                         "Setup": f"Sell {pe_candidate['short_strike']} PE & {ce_candidate['short_strike']} CE",
                         "Spot_Price": spot_price,
                         "Risk_Reward": f"{rr_ratio_ic}:1",
                         "RR_Ratio": rr_ratio_ic, "Net_Premium": total_credit_ic,
                         "Short_Delta": max_abs_delta_ic, "ATR_Moat": worst_moat_ic,
-                        "Pass_Delta": bool(max_abs_delta_ic <= 0.15),
+                        "Pass_Delta": bool(max_abs_delta_ic <= 0.20),
                         "Pass_Moat": bool(ce_candidate['moat_atr'] >= 1.5 and pe_candidate['moat_atr'] >= 1.5),
                         "Max_Profit_₹": round(total_credit_ic * lot_size, 2),
                         "Max_Risk_₹": round(max_risk_ic * lot_size, 2),
                         "Lot_Size": lot_size,
                         "Wall_Strength": wall_str_ic,
-                        "Wall_OI": ce_candidate['wall_oi'] + pe_candidate['wall_oi']
+                        "Wall_OI": ce_candidate['wall_oi'] + pe_candidate['wall_oi'],
+                        "L2_Execution_Risk": "Awaiting L2 Check"
                     })
 
         final_df = pd.DataFrame(spreads)
