@@ -135,7 +135,13 @@ class QuantitativeScoringEngine:
                 yf_tickers = " ".join([f"{sym}.NS" for sym in symbols])
                 
                 # Fetch last 40 days of closing prices in one batch
-                data = yf.download(yf_tickers, period="2mo", progress=False)
+                data = yf.download(
+                    yf_tickers, 
+                    period="2mo", 
+                    progress=False, 
+                    threads=True, 
+                    timeout=10
+                )
                 
                 if 'Close' in data:
                     closes = data['Close']
