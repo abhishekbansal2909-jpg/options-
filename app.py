@@ -68,6 +68,12 @@ bhavcopy_file = st.sidebar.file_uploader("Upload NSE Bhavcopy (ZIP/CSV)", type=[
 participant_file = st.sidebar.file_uploader("Upload Participant OI (CSV)", type=['csv'])
 
 st.sidebar.header("2. Base Filters")
+universe_filter = st.sidebar.radio(
+    "Liquidity Universe (Speed)",
+    options=["Top 50 Liquid (Fast)", "Top 100 Liquid (Balanced)", "All F&O (Slow)"],
+    index=0
+)
+
 expiry_filter = st.sidebar.radio(
     "Select Expiry Cycle",
     options=["Both", "Near", "Next"],
@@ -84,11 +90,8 @@ strategy_filter = st.sidebar.multiselect(
 # Core Execution Engine (Cached)
 # ==========================================
 @st.cache_data(show_spinner=False)
-def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes):
-    """
-    The underscores on _bhavcopy_bytes and _participant_bytes tell Streamlit 
-    NOT to hash the massive raw files, preventing Render RAM crashes.
-    """
+def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes, _universe_filter):
+    """Caches the heavy yfinance network calls and Black-Scholes math in server RAM."""
     temp_path = f"temp_{bhavcopy_name}"
     temp_part_path = "temp_participant.csv" if _participant_bytes else None
     
@@ -105,8 +108,9 @@ def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes):
             tide_status, tide_ratio = get_fii_tide(temp_part_path)
             tide_info = f"**MACRO TIDE:** {tide_status} | **FII Long Ratio:** {tide_ratio}%"
 
-        # 2. Bhavcopy Extraction & Normalization
-        ingestion = OptionsDataIngestion(file_path=temp_path)
+        # 2. Bhavcopy Extraction & Liquidity Filtering
+        max_symbols = 50 if "50" in _universe_filter else (100 if "100" in _universe_filter else None)
+        ingestion = OptionsDataIngestion(file_path=temp_path, max_symbols=max_symbols)
         raw_df = ingestion.load_bhavcopy()
         
         # 3. Market Context & Syncing 
@@ -142,8 +146,8 @@ if st.sidebar.button("Run Quantitative Scan", type="primary"):
                 bhav_name = bhavcopy_file.name
                 part_bytes = participant_file.getvalue() if participant_file else None
                 
-                # Pass variables into the function (they map to the underscore arguments above)
-                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, bhav_name, part_bytes)
+                # Pass variables into the function 
+                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, bhav_name, part_bytes, universe_filter)
                 
                 if tide_info:
                     st.info(tide_info)
@@ -181,7 +185,6 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
             default=["🟢 Reinforced", "🟢 Dual Reinforced", "⚪ Neutral", "⚪ Mixed Strength"]
         )
 
-    # Apply filters dynamically 
     display_df = st.session_state['spreads_df'].copy()
     
     if expiry_filter != "Both" and 'Expiry_Cycle' in display_df.columns:
@@ -205,13 +208,11 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     
     available_cols = display_df.columns.tolist()
     
-    # Updated column order exposing the new Glass Engine metrics
     cols_to_show = [
         'Symbol', 'Regime', 'Score', 'Strategy', 'Setup', 'Spot_Price', 'EMA_20', 'EMA_Dist_%',
         'Expiry_Date', 'DTE', 'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
         'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI', 'L2_Execution_Risk'
     ]
-    
     cols_to_show = [c for c in cols_to_show if c in available_cols]
     
     format_dict = {
@@ -225,7 +226,6 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         'Max_Risk_₹': '₹{:,.2f}',
         'Wall_OI': '{:,}' 
     }
-    
     format_dict = {k: v for k, v in format_dict.items() if k in cols_to_show}
     
     st.dataframe(
