@@ -1,268 +1,241 @@
-import glob
-import os
-import re
-import zipfile
+import streamlit as st
 import pandas as pd
-import numpy as np
-from scipy.stats import norm
+import os
+from datetime import datetime
+from engine import OptionsDataIngestion, QuantitativeScoringEngine
+from spotexpiry import SpotAndExpiryEngine
+from spread_builder import SpreadBuilderEngine
 
-INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+# ==========================================
+# FII Macro Tide Helper
+# ==========================================
+def get_fii_tide(filepath):
+    try:
+        df = pd.read_csv(filepath)
+        header_row_idx = None
+        for idx in range(min(5, len(df))):
+            row_vals = [str(x).upper() for x in df.iloc[idx].dropna().tolist()]
+            row_str = " ".join(row_vals)
+            if "CLIENT" in row_str or "PARTICIPANT" in row_str or "FUTURE" in row_str:
+                header_row_idx = idx + 1
+                break
+                
+        if header_row_idx is not None:
+            df = pd.read_csv(filepath, skiprows=header_row_idx)
+                    
+        df.columns = df.columns.astype(str).str.strip().str.upper().str.replace(" ", "_").str.replace("\t", "")
+        
+        client_col = next((c for c in df.columns if any(k in c for k in ["CLIENT", "PARTIC"])), df.columns[0] if len(df.columns) > 0 else None)
+        fut_long_col = next((c for c in df.columns if "FUTURE_INDEX_LONG" in c or "FUTIDX_LONG" in c), None)
+        fut_short_col = next((c for c in df.columns if "FUTURE_INDEX_SHORT" in c or "FUTIDX_SHORT" in c), None)
 
-class OptionsDataIngestion:
-    """Handles discovery, unzipping, normalization, and filtering of NSE F&O Bhavcopy data."""
-
-    def __init__(self, file_path=None):
-        self.file_path = file_path or self._locate_bhavcopy()
-
-    def _locate_bhavcopy(self) -> str | None:
-        patterns = [
-            "/content/BhavCopy*.zip", "/content/BhavCopy*.csv", "/content/op*.csv",
-            "BhavCopy*.zip", "BhavCopy*.csv", "op*.csv"
-        ]
-        for pat in patterns:
-            matches = glob.glob(pat)
-            if matches:
-                return sorted(matches)[-1]
-        return None
-
-    def load_bhavcopy(self) -> pd.DataFrame:
-        if not self.file_path or not os.path.exists(self.file_path):
-            raise FileNotFoundError("❌ F&O Bhavcopy file not found.")
-
-        if self.file_path.endswith(".zip"):
-            with zipfile.ZipFile(self.file_path, 'r') as z:
-                csv_filename = [f for f in z.namelist() if f.endswith('.csv')][0]
-                with z.open(csv_filename) as f:
-                    df = pd.read_csv(f, low_memory=False)
+        if not client_col or not fut_long_col or not fut_short_col:
+            return "UNAVAILABLE", 50.0
+            
+        df[client_col] = df[client_col].astype(str).str.strip().str.upper()
+        fii_rows = df[df[client_col].str.contains("FII|FPI|FOREIGN", case=False, na=False)]
+        
+        if fii_rows.empty:
+            return "UNAVAILABLE", 50.0
+            
+        fii_long = float(pd.to_numeric(fii_rows[fut_long_col].values[0], errors="coerce") or 0)
+        fii_short = float(pd.to_numeric(fii_rows[fut_short_col].values[0], errors="coerce") or 0)
+        
+        total = fii_long + fii_short
+        fii_ratio = round((fii_long / total) * 100, 2) if total > 0 else 50.0
+        
+        if fii_ratio >= 60.0:
+            return "🟢 GREEN TIDE (FII Net Long)", fii_ratio
+        elif fii_ratio <= 40.0:
+            return "🔴 RED TIDE (FII Net Short)", fii_ratio
         else:
-            df = pd.read_csv(self.file_path, low_memory=False)
+            return "⚪ NEUTRAL TIDE (Balanced)", fii_ratio
+    except Exception as e:
+        return f"ERROR ({str(e)})", 50.0
 
-        # Standardize headers by removing spaces and underscores
-        df.columns = df.columns.astype(str).str.strip().str.upper().str.replace("_", "").str.replace(" ", "")
+# ==========================================
+# UI Configuration
+# ==========================================
+st.set_page_config(page_title="Quantitative Spread Engine", layout="wide", initial_sidebar_state="expanded")
+st.title("🦅 Quantitative Credit Spread Dashboard")
+st.markdown("Algorithmic Underwriting Engine | Ranked by Composite Safety Score & Institutional Boundaries")
 
-        # Map known UDiFF & legacy variations
-        column_map = {
-            "TCKRSYMB": "Symbol", "TRADGSYMB": "Symbol", "UNDRLNGST": "Symbol", "SYMBOL": "Symbol",
-            "OPTNTP": "Option_Type", "OPTIONTYP": "Option_Type", "OPTIONTYPE": "Option_Type",
-            "STRKPRIC": "Strike", "STRKPRC": "Strike", "STRIKEPRC": "Strike", "STRIKE": "Strike",
-            "OPNINTRST": "OI", "OINOCON": "OI", "OPENINT": "OI", "OI": "OI",
-            "CHNGINOPNINTRST": "OI_Change", "CHGINOI": "OI_Change", "CHGOI": "OI_Change", 
-            "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change",
-            "CLSPRIC": "LTP", "SETTLMPRIC": "LTP", "CLOSEPRIC": "LTP", "CLOSE": "LTP", "LTP": "LTP",
-            "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date", "XPIRYDT": "Expiry_Date",
-            "EXPRYDT": "Expiry_Date", "EXPIRATIONDATE": "Expiry_Date", "EXPIRYDATE": "Expiry_Date"
-        }
-        df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
+# ==========================================
+# Sidebar Controls
+# ==========================================
+st.sidebar.header("1. Data Ingestion")
+bhavcopy_file = st.sidebar.file_uploader("Upload NSE Bhavcopy (ZIP/CSV)", type=['csv', 'zip'])
+participant_file = st.sidebar.file_uploader("Upload Participant OI (CSV)", type=['csv'])
 
-        if "OI_Change" not in df.columns:
-            fuzzy_oi_cols = [c for c in df.columns if ("CHG" in c or "CHNG" in c) and ("OI" in c or "OPN" in c)]
-            if fuzzy_oi_cols:
-                df["OI_Change"] = df[fuzzy_oi_cols[0]]
+st.sidebar.header("2. Base Filters")
+expiry_filter = st.sidebar.radio(
+    "Select Expiry Cycle",
+    options=["Both", "Near", "Next"],
+    index=0
+)
 
-        if "CONTRACTD" in df.columns:
-            if "Option_Type" not in df.columns:
-                df["Option_Type"] = df["CONTRACTD"].astype(str).str.extract(r"\b(CE|PE)\b", flags=re.IGNORECASE)
-            if "Strike" not in df.columns:
-                extracted = df["CONTRACTD"].astype(str).str.extract(r"(\d+(?:\.\d+)?)\s*(?:CE|PE)|\b(?:CE|PE)\s*(\d+(?:\.\d+)?)\b", flags=re.IGNORECASE)
-                df["Strike"] = extracted[0].fillna(extracted[1])
+strategy_filter = st.sidebar.multiselect(
+    "Select Strategies to Process", 
+    options=["Bear Call Spread", "Bull Put Spread", "Iron Condor"],
+    default=["Bear Call Spread", "Bull Put Spread", "Iron Condor"]
+)
 
-        if "Option_Type" not in df.columns or "Symbol" not in df.columns:
-            raise KeyError("❌ Failed to parse required fields ('Option_Type', 'Symbol').")
-
-        df["Option_Type"] = df["Option_Type"].astype(str).str.strip().str.upper()
-        df = df[df["Option_Type"].isin(["CE", "PE"])].copy()
-
-        df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-        df = df[~df["Symbol"].isin(INDEX_SYMBOLS)].copy()
-
-        df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
-        df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0)
-        
-        if "LTP" not in df.columns:
-            df["LTP"] = 0.0
-        df["LTP"] = pd.to_numeric(df["LTP"], errors="coerce").fillna(0.0)
-        
-        if "OI_Change" not in df.columns:
-            df["OI_Change"] = 0.0
-        df["OI_Change"] = pd.to_numeric(df["OI_Change"], errors="coerce").fillna(0)
-
-        if "Expiry_Date" in df.columns:
-            df["Expiry_Date"] = pd.to_datetime(df["Expiry_Date"], errors="coerce")
-        else:
-            df["Expiry_Date"] = pd.NaT
-
-        df = df.dropna(subset=["Symbol", "Option_Type", "Strike"])
-        
-        return df[['Symbol', 'Expiry_Date', 'Option_Type', 'Strike', 'LTP', 'OI', 'OI_Change']]
-
-
-class QuantitativeScoringEngine:
+# ==========================================
+# Core Execution Engine (Cached)
+# ==========================================
+@st.cache_data(show_spinner=False)
+def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes):
     """
-    Applies the 'Glass-Box' quantitative filters: ATR moats, Delta limits, 
-    Premium yields, and Institutional Wall detection without dropping rows.
+    The underscores on _bhavcopy_bytes and _participant_bytes tell Streamlit 
+    NOT to hash the massive raw files, preventing Render RAM crashes.
     """
-    def __init__(self, options_df, market_data_df, risk_free_rate=0.07):
-        """
-        market_data_df requires columns: 
-        ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event']
-        EMA metrics are fetched statelessly via yfinance.
-        """
-        self.df = options_df.copy()
-        self.market_data = market_data_df
-        self.r = risk_free_rate
+    temp_path = f"temp_{bhavcopy_name}"
+    temp_part_path = "temp_participant.csv" if _participant_bytes else None
+    
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(_bhavcopy_bytes)
+        if temp_part_path:
+            with open(temp_part_path, "wb") as f:
+                f.write(_participant_bytes)
+                
+        # 1. Macro Tide
+        tide_info = None
+        if temp_part_path:
+            tide_status, tide_ratio = get_fii_tide(temp_part_path)
+            tide_info = f"**MACRO TIDE:** {tide_status} | **FII Long Ratio:** {tide_ratio}%"
 
-    def run_glass_box_pipeline(self, current_date):
-        self._merge_market_context()
-        self._detect_institutional_walls()
-        self._compute_moats()
-        self._compute_delta(current_date)
-        self._generate_composite_score()
-        return self.df
-
-    def _merge_market_context(self):
-        # 1. Merge Spot, ATR, Beta, Event data from the UI stream
-        self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
+        # 2. Bhavcopy Extraction & Normalization
+        ingestion = OptionsDataIngestion(file_path=temp_path)
+        raw_df = ingestion.load_bhavcopy()
         
-        # 2. STATELESS CLOUD FIX (Render Optimized): Chunked sequential fetching
-        if 'EMA_20' not in self.df.columns or self.df['EMA_20'].isna().all():
+        # 3. Market Context & Syncing 
+        active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
+        synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
+        
+        market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
+        available_context = [c for c in market_context_cols if c in synced_df.columns]
+        market_context_df = synced_df[available_context].drop_duplicates()
+        
+        # 4. Glass-Box Scoring Engine 
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        quant_engine = QuantitativeScoringEngine(active_df, market_context_df)
+        scored_df = quant_engine.run_glass_box_pipeline(current_date_str)
+        
+        # 5. Build Spreads
+        spreads_df = SpreadBuilderEngine.build_spreads(scored_df)
+        return spreads_df, tide_info
+        
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if temp_part_path and os.path.exists(temp_part_path):
+            os.remove(temp_part_path)
+
+if st.sidebar.button("Run Quantitative Scan", type="primary"):
+    if bhavcopy_file is None:
+        st.sidebar.error("⚠️ Please upload a Bhavcopy file to proceed.")
+    else:
+        with st.spinner("Initializing Quantitative Engine, Fetching EMAs & Calculating Greeks..."):
             try:
-                import yfinance as yf
-                import warnings
-                warnings.filterwarnings('ignore') # Suppress yf warnings
+                bhav_bytes = bhavcopy_file.getvalue()
+                bhav_name = bhavcopy_file.name
+                part_bytes = participant_file.getvalue() if participant_file else None
                 
-                symbols = self.df['Symbol'].unique().tolist()
-                ema_dict = {}
+                # Pass variables into the function (they map to the underscore arguments above)
+                spreads_df, tide_info = run_quant_pipeline(bhav_bytes, bhav_name, part_bytes)
                 
-                # Break the 180+ tickers into manageable chunks of 40
-                chunk_size = 40
-                for i in range(0, len(symbols), chunk_size):
-                    chunk = symbols[i:i + chunk_size]
-                    yf_tickers = " ".join([f"{sym}.NS" for sym in chunk])
+                if tide_info:
+                    st.info(tide_info)
                     
-                    # threads=False is CRITICAL here to prevent Render's CPU from choking
-                    data = yf.download(
-                        yf_tickers, 
-                        period="2mo", 
-                        progress=False, 
-                        threads=False, 
-                        timeout=15
-                    )
-                    
-                    if 'Close' in data:
-                        closes = data['Close']
-                        for sym in chunk:
-                            yf_sym = f"{sym}.NS"
-                            
-                            # Handle yfinance formatting (DataFrame for multiple, Series for single)
-                            if isinstance(closes, pd.DataFrame):
-                                if yf_sym in closes.columns:
-                                    ticker_closes = closes[yf_sym].dropna()
-                                else:
-                                    continue
-                            else:
-                                ticker_closes = closes.dropna()
-                                
-                            if not ticker_closes.empty:
-                                ema_20 = ticker_closes.ewm(span=20, adjust=False).mean().iloc[-1]
-                                ema_dict[sym] = round(ema_20, 2)
-                                
-                self.df['EMA_20'] = self.df['Symbol'].map(ema_dict)
-                self.df['EMA_DIST_PCT'] = np.round(((self.df['Spot_Price'] - self.df['EMA_20']) / self.df['EMA_20']) * 100, 2)
+                st.session_state['spreads_df'] = spreads_df
+                st.success("✅ Engine computation complete. Displaying full algorithmic state.")
             except Exception as e:
-                print(f"Cloud EMA Fetch Failed: {e}")
+                st.error(f"Pipeline Error: {str(e)}")
 
-        # 3. Graceful fallback for missing tickers or failed fetches
-        if 'EMA_20' not in self.df.columns:
-            self.df['EMA_20'] = self.df['Spot_Price']
-            self.df['EMA_DIST_PCT'] = 0.0
-        else:
-            self.df['EMA_20'] = self.df['EMA_20'].fillna(self.df['Spot_Price'])
-            self.df['EMA_DIST_PCT'] = self.df['EMA_DIST_PCT'].fillna(0.0)
+# ==========================================
+# Dynamic Grid Filters (Glass-Box UI)
+# ==========================================
+if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty:
+    st.divider()
+    st.subheader("🔍 Quantitative Filters")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        search_symbol = st.text_input("Search Symbol", placeholder="e.g., RELIANCE")
+    with col2:
+        regime_filter = st.multiselect(
+            "Regime Alignment", 
+            options=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"],
+            default=["🟢 Trend Aligned", "🟢 Range Bound"] 
+        )
+    with col3:
+        min_score = st.number_input("Min Composite Score", min_value=-50, max_value=100, value=50, step=10)
+    with col4:
+        max_delta = st.number_input("Max Short Delta", min_value=0.01, max_value=1.00, value=0.20, step=0.01)
+    with col5:
+        wall_filter = st.multiselect(
+            "Wall Strength", 
+            options=["🟢 Reinforced", "🟢 Dual Reinforced", "🔴 Crumbling", "🔴 Both Crumbling", "⚪ Neutral", "⚪ Mixed Strength"],
+            default=["🟢 Reinforced", "🟢 Dual Reinforced", "⚪ Neutral", "⚪ Mixed Strength"]
+        )
+
+    # Apply filters dynamically 
+    display_df = st.session_state['spreads_df'].copy()
+    
+    if expiry_filter != "Both" and 'Expiry_Cycle' in display_df.columns:
+        display_df = display_df[display_df["Expiry_Cycle"] == expiry_filter]
             
-        self.df.dropna(subset=['Spot_Price', 'EMA_20'], inplace=True)
-
-    def _detect_institutional_walls(self):
-        # Find the strikes with the maximum Open Interest (The Iron Condor boundaries)
-        idx_call_wall = self.df[self.df['Option_Type'] == 'CE'].groupby('Symbol')['OI'].idxmax()
-        idx_put_wall = self.df[self.df['Option_Type'] == 'PE'].groupby('Symbol')['OI'].idxmax()
-
-        call_walls = self.df.loc[idx_call_wall, ['Symbol', 'Strike']].rename(columns={'Strike': 'Call_Wall'})
-        put_walls = self.df.loc[idx_put_wall, ['Symbol', 'Strike']].rename(columns={'Strike': 'Put_Wall'})
-
-        self.df = pd.merge(self.df, call_walls, on='Symbol', how='left')
-        self.df = pd.merge(self.df, put_walls, on='Symbol', how='left')
-
-        # Allow the 20-Day EMA to act as a valid institutional wall for Calls in a net-short tape
-        self.df['Outside_Inst_Wall'] = np.where(
-            self.df['Option_Type'] == 'CE',
-            (self.df['Strike'] >= self.df['Call_Wall']) | (self.df['Strike'] >= self.df['EMA_20']),
-            self.df['Strike'] <= self.df['Put_Wall']
-        )
-
-    def _compute_moats(self):
-        # Calculate raw percentage distance and ATR multiples
-        distance = np.abs(self.df['Strike'] - self.df['Spot_Price'])
+    display_df = display_df[display_df["Strategy"].isin(strategy_filter)]
+    
+    if search_symbol:
+        display_df = display_df[display_df["Symbol"].str.contains(search_symbol.upper())]
         
-        self.df['Moat_Percent'] = (distance / self.df['Spot_Price']) * 100
-        self.df['Moat_ATR'] = distance / self.df['ATR_14']
-
-        # Beta adjusted safety rules
-        self.df['Pass_Moat'] = np.where(
-            self.df['Beta'] > 1.2,
-            (self.df['Moat_Percent'] >= 7.0) & (self.df['Moat_ATR'] >= 2.0),
-            (self.df['Moat_Percent'] >= 5.0) & (self.df['Moat_ATR'] >= 1.5)
-        )
-
-    def _compute_delta(self, current_date):
-        if 'IV' not in self.df.columns:
-            self.df['IV'] = 0.30 
-            
-        dte = (pd.to_datetime(self.df['Expiry_Date']) - pd.to_datetime(current_date)).dt.days
-        dte = np.where(dte <= 0, 1, dte)
-        T = dte / 365.0
+    display_df = display_df[display_df["Score"] >= min_score]
+    display_df = display_df[display_df["Short_Delta"].abs() <= max_delta]
+    
+    if 'Regime' in display_df.columns:
+        display_df = display_df[display_df["Regime"].isin(regime_filter)]
         
-        S = self.df['Spot_Price'].values
-        K = self.df['Strike'].values
-        sigma = self.df['IV'].values
-        
-        d1 = (np.log(S / K) + (self.r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        
-        call_delta = norm.cdf(d1)
-        put_delta = call_delta - 1
-        
-        self.df['Delta'] = np.where(self.df['Option_Type'] == 'CE', call_delta, put_delta)
-        
-        # Widen Delta allowance specifically for Bear Call regimes (up to 0.20)
-        self.df['Pass_Delta'] = np.where(
-            self.df['Option_Type'] == 'CE',
-            np.abs(self.df['Delta']) <= 0.20,
-            np.abs(self.df['Delta']) <= 0.13
-        )
-
-    def _generate_composite_score(self):
-        self.df['Pass_Event'] = self.df['Days_To_Event'] > 14
-        
-        # Determine Regime Alignment
-        self.df['Regime_Aligned'] = np.where(
-            self.df['Option_Type'] == 'CE',
-            self.df['Spot_Price'] < self.df['EMA_20'],
-            self.df['Spot_Price'] > self.df['EMA_20']
-        )
-        
-        # Flag if data is missing (Spot exactly equals EMA fallback)
-        self.df['Missing_EMA'] = self.df['Spot_Price'] == self.df['EMA_20']
-        
-        # Base Score (0 to 100)
-        score = np.zeros(len(self.df))
-        score += np.where(self.df['Pass_Delta'], 25, 0)
-        score += np.where(self.df['Pass_Moat'], 25, 0)
-        score += np.where(self.df['Outside_Inst_Wall'], 20, 0)
-        score += np.where(self.df['Pass_Event'], 15, 0)
-        
-        # Apply +15 for Aligned, 0 for Missing Data, -40 for Counter-Trend
-        score += np.where(
-            self.df['Regime_Aligned'], 15, 
-            np.where(self.df['Missing_EMA'], 0, -40)
-        ) 
-        
-        self.df['Composite_Score'] = score
+    if 'Wall_Strength' in display_df.columns:
+        display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
+    
+    st.caption(f"Showing **{len(display_df)}** statistically filtered setups.")
+    
+    available_cols = display_df.columns.tolist()
+    
+    # Updated column order exposing the new Glass Engine metrics
+    cols_to_show = [
+        'Symbol', 'Regime', 'Score', 'Strategy', 'Setup', 'Spot_Price', 'EMA_20', 'EMA_Dist_%',
+        'Expiry_Date', 'DTE', 'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
+        'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI', 'L2_Execution_Risk'
+    ]
+    
+    cols_to_show = [c for c in cols_to_show if c in available_cols]
+    
+    format_dict = {
+        'Spot_Price': '₹{:.2f}',
+        'EMA_20': '₹{:.2f}',
+        'EMA_Dist_%': '{:.2f}%',
+        'Short_Delta': '{:.3f}',
+        'ATR_Moat': '{:.2f}x',
+        'Net_Premium': '₹{:.2f}',
+        'Max_Profit_₹': '₹{:,.2f}',
+        'Max_Risk_₹': '₹{:,.2f}',
+        'Wall_OI': '{:,}' 
+    }
+    
+    format_dict = {k: v for k, v in format_dict.items() if k in cols_to_show}
+    
+    st.dataframe(
+        display_df[cols_to_show].style.background_gradient(
+            subset=['Score'] if 'Score' in cols_to_show else [], cmap='RdYlGn', vmin=0, vmax=100
+        ).background_gradient(
+            subset=['ATR_Moat'] if 'ATR_Moat' in cols_to_show else [], cmap='RdYlGn'
+        ).background_gradient(
+            subset=['Short_Delta'] if 'Short_Delta' in cols_to_show else [], cmap='RdYlGn_r'  
+        ).format(format_dict),
+        use_container_width=True,
+        hide_index=True
+    )
