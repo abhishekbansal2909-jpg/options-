@@ -31,22 +31,21 @@ class SpreadBuilderEngine:
         lot_dict = SpreadBuilderEngine.fetch_lot_sizes()
         spreads = []
         
-        # Ensure Expiry_Date exists to avoid KeyError if pipeline is missing data
         if 'Expiry_Date' not in df.columns:
             print("⚠️ Expiry_Date missing from data. Defaulting to single-cycle grouping.")
             df['Expiry_Date'] = 'Unknown'
             df['Expiry_Cycle'] = 'Near'
-            df['DTE'] = 0
+            df['Days_To_Event'] = 0
 
-        # CRITICAL UPDATE: Group by both Symbol AND Expiry_Date to prevent cross-month contamination
         for (sym, expiry_date), group in df.groupby(["Symbol", "Expiry_Date"]):
             spot_price = group['Spot_Price'].iloc[0]
             lot_size = lot_dict.get(sym, 1) 
             
-            # Extract time metadata
             expiry_str = expiry_date.strftime('%Y-%m-%d') if isinstance(expiry_date, pd.Timestamp) else str(expiry_date)
             cycle = group.get('Expiry_Cycle', pd.Series(['Unknown'])).iloc[0]
-            dte = group.get('DTE', pd.Series([0])).iloc[0]
+            
+            # Updated to catch Option B's column name
+            dte = group.get('Days_To_Event', group.get('DTE', pd.Series([0]))).iloc[0]
             
             ce_candidate = None
             pe_candidate = None
@@ -200,7 +199,6 @@ class SpreadBuilderEngine:
 
         final_df = pd.DataFrame(spreads)
         if not final_df.empty:
-            # Sort by Expiry Date first, then Score and Risk/Reward
             final_df = final_df.sort_values(
                 by=["Expiry_Date", "Score", "RR_Ratio"], 
                 ascending=[True, False, True]
