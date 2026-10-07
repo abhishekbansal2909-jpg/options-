@@ -125,10 +125,14 @@ class QuantitativeScoringEngine:
         # 2. BULLETPROOF FALLBACK: Reverse-engineer Spot_Price mathematically 
         if 'Spot_Price' not in self.df.columns or self.df['Spot_Price'].isna().all():
             try:
-                # ATM Strike is where the difference between Call and Put premium is smallest
-                pivot_df = self.df.pivot_table(index=['Symbol', 'Strike'], columns='Option_Type', values='LTP', aggfunc='first').reset_index()
+                # CRITICAL FIX: Filter out 0 LTP first. Illiquid strikes have 0 LTP for both CE and PE,
+                # making their Diff = 0 and causing the engine to peg Spot to the wrong strike.
+                valid_df = self.df[self.df['LTP'] > 0] 
+                pivot_df = valid_df.pivot_table(index=['Symbol', 'Strike'], columns='Option_Type', values='LTP', aggfunc='first').reset_index()
+                
                 if 'CE' in pivot_df.columns and 'PE' in pivot_df.columns:
-                    pivot_df['Diff'] = np.abs(pivot_df['CE'].fillna(0) - pivot_df['PE'].fillna(0))
+                    pivot_df = pivot_df.dropna(subset=['CE', 'PE'])
+                    pivot_df['Diff'] = np.abs(pivot_df['CE'] - pivot_df['PE'])
                     idx_min = pivot_df.groupby('Symbol')['Diff'].idxmin().dropna()
                     atm_map = pivot_df.loc[idx_min].set_index('Symbol')['Strike']
                     self.df['Spot_Price'] = self.df['Symbol'].map(atm_map)
@@ -141,13 +145,13 @@ class QuantitativeScoringEngine:
         self.df['Spot_Price'] = self.df.get('Spot_Price', self.df['Strike']).fillna(self.df['Strike'])
         
         if 'ATR_14' not in self.df.columns:
-            self.df['ATR_14'] = self.df['Spot_Price'] * 0.02 # Safe default: 2% average daily range
+            self.df['ATR_14'] = self.df['Spot_Price'] * 0.025 # Safe default: 2.5% average daily range
         if 'Beta' not in self.df.columns:
             self.df['Beta'] = 1.0
         if 'Days_To_Event' not in self.df.columns:
             self.df['Days_To_Event'] = 30
             
-        self.df['ATR_14'] = self.df['ATR_14'].fillna(self.df['Spot_Price'] * 0.02)
+        self.df['ATR_14'] = self.df['ATR_14'].fillna(self.df['Spot_Price'] * 0.025)
         self.df['Beta'] = self.df['Beta'].fillna(1.0)
         self.df['Days_To_Event'] = self.df['Days_To_Event'].fillna(30)
         
