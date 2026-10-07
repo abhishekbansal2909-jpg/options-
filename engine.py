@@ -1,4 +1,3 @@
-
 import glob
 import os
 import re
@@ -102,7 +101,8 @@ class OptionsDataIngestion:
 
 class QuantitativeScoringEngine:
     """
-    Applies internal stateless quantitative filters without relying on external APIs.
+    Applies internal stateless quantitative filters. 
+    Reverse-engineers missing Spot Prices using ATM Strike intersection.
     """
     def __init__(self, options_df, market_data_df, risk_free_rate=0.07):
         self.df = options_df.copy()
@@ -118,19 +118,46 @@ class QuantitativeScoringEngine:
         return self.df
 
     def _merge_market_context(self):
-        # 1. Merge Spot, ATR, Beta, Event data from UI stream
-        self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
+        # 1. Merge incoming UI stream data
+        if not self.market_data.empty:
+            self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
         
-        # 2. STATELESS INTERNAL PROXY: Use Spot price adjusted by ATR/Momentum as EMA Proxy 
-        # This requires ZERO network calls, making execution instantaneous on Render.
-        if 'EMA_20' not in self.df.columns or self.df['EMA_20'].isna().all():
-            # Approximate trend baseline internally using Spot and Beta/ATR structure
-            self.df['EMA_20'] = self.df['Spot_Price']
-            self.df['EMA_DIST_PCT'] = 0.0
+        # 2. BULLETPROOF FALLBACK: Reverse-engineer Spot_Price if database is missing
+        if 'Spot_Price' not in self.df.columns or self.df['Spot_Price'].isna().all():
+            try:
+                # Pivot to align Calls and Puts by Strike
+                pivot_df = self.df.pivot_table(index=['Symbol', 'Strike'], columns='Option_Type', values='LTP', aggfunc='first').reset_index()
+                if 'CE' in pivot_df.columns and 'PE' in pivot_df.columns:
+                    # ATM Strike is where the difference between Call and Put premium is smallest
+                    pivot_df['Diff'] = np.abs(pivot_df['CE'].fillna(0) - pivot_df['PE'].fillna(0))
+                    idx_min = pivot_df.groupby('Symbol')['Diff'].idxmin().dropna()
+                    atm_map = pivot_df.loc[idx_min].set_index('Symbol')['Strike']
+                    self.df['Spot_Price'] = self.df['Symbol'].map(atm_map)
+                else:
+                    self.df['Spot_Price'] = self.df['Strike']
+            except Exception:
+                self.df['Spot_Price'] = self.df['Strike']
 
+        # 3. Ensure all quantitative columns exist so math operations do not throw KeyErrors
+        self.df['Spot_Price'] = self.df.get('Spot_Price', self.df['Strike']).fillna(self.df['Strike'])
+        
+        # Generate proxies for missing DB data
+        if 'EMA_20' not in self.df.columns:
+            self.df['EMA_20'] = self.df['Spot_Price']
+        if 'ATR_14' not in self.df.columns:
+            self.df['ATR_14'] = self.df['Spot_Price'] * 0.02 # Safe default: 2% average daily range
+        if 'Beta' not in self.df.columns:
+            self.df['Beta'] = 1.0
+        if 'Days_To_Event' not in self.df.columns:
+            self.df['Days_To_Event'] = 30
+            
         self.df['EMA_20'] = self.df['EMA_20'].fillna(self.df['Spot_Price'])
-        self.df['EMA_DIST_PCT'] = self.df['EMA_DIST_PCT'].fillna(0.0)
-        self.df.dropna(subset=['Spot_Price', 'EMA_20'], inplace=True)
+        self.df['ATR_14'] = self.df['ATR_14'].fillna(self.df['Spot_Price'] * 0.02)
+        self.df['Beta'] = self.df['Beta'].fillna(1.0)
+        self.df['Days_To_Event'] = self.df['Days_To_Event'].fillna(30)
+        
+        self.df['EMA_DIST_PCT'] = 0.0
+        self.df.dropna(subset=['Spot_Price'], inplace=True)
 
     def _detect_institutional_walls(self):
         idx_call_wall = self.df[self.df['Option_Type'] == 'CE'].groupby('Symbol')['OI'].idxmax()
@@ -188,7 +215,7 @@ class QuantitativeScoringEngine:
     def _generate_composite_score(self):
         self.df['Pass_Event'] = self.df['Days_To_Event'] > 14
         
-        self.df['Regime_Aligned'] = True # Default to neutral alignment internally
+        self.df['Regime_Aligned'] = True 
         self.df['Missing_EMA'] = False
         
         score = np.zeros(len(self.df))
@@ -196,6 +223,7 @@ class QuantitativeScoringEngine:
         score += np.where(self.df['Pass_Moat'], 25, 0)
         score += np.where(self.df['Outside_Inst_Wall'], 20, 0)
         score += np.where(self.df['Pass_Event'], 15, 0)
-        score += 15 # Full regime compliance bonus without network bottlenecks
+        score += 15 
         
         self.df['Composite_Score'] = score
+
