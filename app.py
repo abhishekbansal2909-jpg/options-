@@ -91,7 +91,6 @@ strategy_filter = st.sidebar.multiselect(
 # ==========================================
 @st.cache_data(show_spinner=False)
 def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes, _universe_filter):
-    """Caches the heavy yfinance network calls and Black-Scholes math in server RAM."""
     temp_path = f"temp_{bhavcopy_name}"
     temp_part_path = "temp_participant.csv" if _participant_bytes else None
     
@@ -117,11 +116,12 @@ def run_quant_pipeline(_bhavcopy_bytes, bhavcopy_name, _participant_bytes, _univ
         active_df = SpotAndExpiryEngine.filter_active_expiries(raw_df, include_next_month=True)
         synced_df = SpotAndExpiryEngine.sync_market_context(active_df)
         
-        market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event', 'EMA_20', 'EMA_DIST_PCT']
+        # Removed EMA columns from expected context
+        market_context_cols = ['Symbol', 'Spot_Price', 'ATR_14', 'Beta', 'Days_To_Event']
         available_context = [c for c in market_context_cols if c in synced_df.columns]
         market_context_df = synced_df[available_context].drop_duplicates()
         
-        # 4. Glass-Box Scoring Engine 
+        # 4. Glass-Box Scoring Engine (No EMA Dependency)
         current_date_str = datetime.now().strftime("%Y-%m-%d")
         quant_engine = QuantitativeScoringEngine(active_df, market_context_df)
         scored_df = quant_engine.run_glass_box_pipeline(current_date_str)
@@ -140,20 +140,19 @@ if st.sidebar.button("Run Quantitative Scan", type="primary"):
     if bhavcopy_file is None:
         st.sidebar.error("⚠️ Please upload a Bhavcopy file to proceed.")
     else:
-        with st.spinner("Initializing Quantitative Engine, Fetching EMAs & Calculating Greeks..."):
+        with st.spinner("Initializing Volatility Engine & Calculating Greeks..."):
             try:
                 bhav_bytes = bhavcopy_file.getvalue()
                 bhav_name = bhavcopy_file.name
                 part_bytes = participant_file.getvalue() if participant_file else None
                 
-                # Pass variables into the function 
                 spreads_df, tide_info = run_quant_pipeline(bhav_bytes, bhav_name, part_bytes, universe_filter)
                 
                 if tide_info:
                     st.info(tide_info)
                     
                 st.session_state['spreads_df'] = spreads_df
-                st.success("✅ Engine computation complete. Displaying full algorithmic state.")
+                st.success("✅ Engine computation complete. Execute manual trend verification before entry.")
             except Exception as e:
                 st.error(f"Pipeline Error: {str(e)}")
 
@@ -164,21 +163,16 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     st.divider()
     st.subheader("🔍 Quantitative Filters")
     
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # Reduced to 4 columns (Removed Regime Alignment)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         search_symbol = st.text_input("Search Symbol", placeholder="e.g., RELIANCE")
     with col2:
-        regime_filter = st.multiselect(
-            "Regime Alignment", 
-            options=["🟢 Trend Aligned", "🔴 Counter-Trend", "🟢 Range Bound", "🔴 Expanding"],
-            default=["🟢 Trend Aligned", "🟢 Range Bound"] 
-        )
+        min_score = st.number_input("Min Composite Score", min_value=0, max_value=100, value=50, step=10)
     with col3:
-        min_score = st.number_input("Min Composite Score", min_value=-50, max_value=100, value=50, step=10)
-    with col4:
         max_delta = st.number_input("Max Short Delta", min_value=0.01, max_value=1.00, value=0.20, step=0.01)
-    with col5:
+    with col4:
         wall_filter = st.multiselect(
             "Wall Strength", 
             options=["🟢 Reinforced", "🟢 Dual Reinforced", "🔴 Crumbling", "🔴 Both Crumbling", "⚪ Neutral", "⚪ Mixed Strength"],
@@ -197,9 +191,6 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         
     display_df = display_df[display_df["Score"] >= min_score]
     display_df = display_df[display_df["Short_Delta"].abs() <= max_delta]
-    
-    if 'Regime' in display_df.columns:
-        display_df = display_df[display_df["Regime"].isin(regime_filter)]
         
     if 'Wall_Strength' in display_df.columns:
         display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
@@ -208,8 +199,9 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     
     available_cols = display_df.columns.tolist()
     
+    # Removed Regime and EMA metrics from display
     cols_to_show = [
-        'Symbol', 'Regime', 'Score', 'Strategy', 'Setup', 'Spot_Price', 'EMA_20', 'EMA_Dist_%',
+        'Symbol', 'Score', 'Strategy', 'Setup', 'Spot_Price',
         'Expiry_Date', 'DTE', 'Short_Delta', 'ATR_Moat', 'Risk_Reward', 'Net_Premium',
         'Max_Profit_₹', 'Max_Risk_₹', 'Wall_Strength', 'Wall_OI', 'L2_Execution_Risk'
     ]
@@ -217,8 +209,6 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     
     format_dict = {
         'Spot_Price': '₹{:.2f}',
-        'EMA_20': '₹{:.2f}',
-        'EMA_Dist_%': '{:.2f}%',
         'Short_Delta': '{:.3f}',
         'ATR_Moat': '{:.2f}x',
         'Net_Premium': '₹{:.2f}',
@@ -239,3 +229,4 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         use_container_width=True,
         hide_index=True
     )
+
