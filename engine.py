@@ -22,14 +22,23 @@ class OptionsDataIngestion:
 
         df.columns = df.columns.astype(str).str.strip().str.upper().str.replace("_", "").str.replace(" ", "")
         
+        # RESTORED: Added all known OI_Change column variations back to the mapping
         rename_dict = {
             "TCKRSYMB": "Symbol", "TRADGSYMB": "Symbol", "SYMBOL": "Symbol", 
             "OPTNTP": "Option_Type", "OPTIONTYP": "Option_Type", "STRKPRIC": "Strike",
             "OPNINTRST": "OI", "OPENINT": "OI", "CLSPRIC": "LTP", "CLOSE": "LTP", 
-            "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date"
+            "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date",
+            "CHNGINOPNINTRST": "OI_Change", "CHGINOI": "OI_Change", "CHGOI": "OI_Change", 
+            "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change", "CHGOPNINTRST": "OI_Change"
         }
         for old, new in rename_dict.items():
             if old in df.columns: df.rename(columns={old: new}, inplace=True)
+
+        # RESTORED: Fuzzy catch for non-standard NSE column names
+        if "OI_Change" not in df.columns:
+            fuzzy_oi_cols = [c for c in df.columns if ("CHG" in c or "CHNG" in c) and ("OI" in c or "OPN" in c)]
+            if fuzzy_oi_cols: 
+                df["OI_Change"] = df[fuzzy_oi_cols[0]]
             
         if "CONTRACTD" in df.columns:
             if "Option_Type" not in df.columns:
@@ -45,6 +54,7 @@ class OptionsDataIngestion:
 
         df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
         df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0)
+        df["OI_Change"] = pd.to_numeric(df.get("OI_Change", 0.0), errors="coerce").fillna(0)
         df["LTP"] = pd.to_numeric(df.get("LTP", 0.0), errors="coerce").fillna(0.0)
         df["Expiry_Date"] = pd.to_datetime(df.get("Expiry_Date", pd.NaT), errors="coerce")
         
