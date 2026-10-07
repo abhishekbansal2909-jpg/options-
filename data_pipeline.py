@@ -1,267 +1,124 @@
-import os
-import io
-import time
 import sqlite3
-import requests
-import zipfile
 import pandas as pd
+import yfinance as yf
 import numpy as np
+import warnings
 from datetime import datetime
-from scipy.stats import norm
 
-# ==============================================================================
-# 1. DATA EXTRACTION (NSE DOWNLOADER)
-# ==============================================================================
-def download_nse_bhavcopy(date_obj, base_dir="data"):
-    """
-    Downloads the F&O and Cash Bhavcopy ZIP files from NSE (UDiFF Format) and extracts them.
-    """
-    os.makedirs(base_dir, exist_ok=True)
-    yyyymmdd = date_obj.strftime("%Y%m%d")
+warnings.filterwarnings('ignore')
+
+def calculate_atr(df, period=14):
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    return true_range.rolling(period).mean()
+
+def update_market_database(bhavcopy_path):
+    print("🚀 Initializing Version 2.0 Local Data Pipeline...")
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br"
-    }
-
-    urls = {
-        "cash": f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip",
-        "fo": f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
-    }
-    
-    file_paths = {}
-
-    for market, url in urls.items():
-        print(f"Downloading {market.upper()} UDiFF Bhavcopy for {yyyymmdd}...")
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                    z.extractall(base_dir)
-                    extracted_file = os.path.join(base_dir, url.split('/')[-1].replace('.zip', ''))
-                    file_paths[market] = extracted_file
-            else:
-                print(f"Failed to download {market} data. Status Code: {response.status_code}")
-                return None
-        except Exception as e:
-            print(f"Error fetching {market} data: {e}")
-            return None
+    # 1. Extract Symbols from Bhavcopy
+    try:
+        if bhavcopy_path.endswith('.zip'):
+            import zipfile
+            with zipfile.ZipFile(bhavcopy_path, 'r') as z:
+                csv_filename = [f for f in z.namelist() if f.endswith('.csv')][0]
+                with z.open(csv_filename) as f:
+                    bhav_df = pd.read_csv(f)
+        else:
+            bhav_df = pd.read_csv(bhavcopy_path)
             
-        time.sleep(1)
-
-    return file_paths
-
-# ==============================================================================
-# 2. HISTORICAL CASH SPOT & 20-DAY EMA ENGINE (GLASS FOUNDATION)
-# ==============================================================================
-def sync_cash_and_compute_ema(df_cash, trade_date_str, db_path="market_data.db"):
-    """
-    Saves daily cash settlement closes into a persistent table and computes
-    rolling 20-day EMA per symbol. Nothing is discarded.
-    """
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    # 1. Maintain cash settlement history table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cash_history (
-            SYMBOL TEXT,
-            TRADE_DATE TEXT,
-            CLOSE REAL,
-            PRIMARY KEY (SYMBOL, TRADE_DATE)
-        )
-    """)
-    
-    # Standardize column headers for cash
-    cash_records = df_cash[['SYMBOL', 'CLOSE']].copy()
-    cash_records['TRADE_DATE'] = trade_date_str
-    cash_records['CLOSE'] = cash_records['CLOSE'].astype(float)
-    
-    # Insert or update today's cash records
-    records_to_insert = [
-        (row['SYMBOL'], row['TRADE_DATE'], row['CLOSE'])
-        for _, row in cash_records.iterrows()
-    ]
-    cursor.executemany("""
-        INSERT OR REPLACE INTO cash_history (SYMBOL, TRADE_DATE, CLOSE)
-        VALUES (?, ?, ?)
-    """, records_to_insert)
-    conn.commit()
-
-    # 2. Pull up to the last 40 trading sessions per symbol to ensure accurate EMA seeding
-    query = """
-        SELECT SYMBOL, TRADE_DATE, CLOSE 
-        FROM cash_history 
-        ORDER BY SYMBOL, DATE(TRADE_DATE) ASC
-    """
-    history_df = pd.read_sql_query(query, conn)
-    conn.close()
-
-    if history_df.empty:
-        cash_records['EMA_20'] = cash_records['CLOSE']
-        cash_records['EMA_DIST_PCT'] = 0.0
-        return cash_records[['SYMBOL', 'CLOSE', 'EMA_20', 'EMA_DIST_PCT']].rename(columns={'CLOSE': 'SPOT_PRICE'})
-
-    # 3. Compute 20-day exponential moving average grouped by ticker
-    history_df['EMA_20'] = (
-        history_df.groupby('SYMBOL')['CLOSE']
-        .transform(lambda x: x.ewm(span=20, adjust=False).mean())
-    )
-    
-    # Extract only the latest computed metrics for each symbol
-    latest_ema = history_df.groupby('SYMBOL').last().reset_index()
-    latest_ema['EMA_DIST_PCT'] = np.round(
-        ((latest_ema['CLOSE'] - latest_ema['EMA_20']) / latest_ema['EMA_20']) * 100, 2
-    )
-    latest_ema['EMA_20'] = np.round(latest_ema['EMA_20'], 2)
-    
-    latest_ema.rename(columns={'CLOSE': 'SPOT_PRICE'}, inplace=True)
-    return latest_ema[['SYMBOL', 'SPOT_PRICE', 'EMA_20', 'EMA_DIST_PCT']]
-
-# ==============================================================================
-# 3. DATA TRANSFORMATION & ENRICHMENT
-# ==============================================================================
-def clean_bhavcopy_for_db(fo_path, cash_path, date_obj, db_path="market_data.db"):
-    """
-    Filters out noise, keeps Near & Next Month contracts, and joins SPOT_PRICE,
-    EMA_20, and EMA_DIST_PCT without dropping counter-trend setups.
-    """
-    df_fo = pd.read_csv(fo_path)
-    df_cash = pd.read_csv(cash_path)
-    
-    df_fo.columns = df_fo.columns.str.strip()
-    df_cash.columns = df_cash.columns.str.strip()
-
-    # Filter for Stock Options
-    df = df_fo[df_fo['INSTRUMENT'] == 'OPTSTK'].copy()
-    df['EXPIRY_DT'] = pd.to_datetime(df['EXPIRY_DT'])
-    
-    # Isolate Near and Next month expiries
-    unique_expiries = sorted(df['EXPIRY_DT'].dropna().unique())
-    if len(unique_expiries) >= 2:
-        df = df[df['EXPIRY_DT'].isin(unique_expiries[:2])].copy()
-    elif len(unique_expiries) == 1:
-        df = df[df['EXPIRY_DT'] == unique_expiries[0]].copy()
-
-    # Dynamic DTE calculation
-    current_date_str = date_obj.strftime("%Y-%m-%d")
-    df['DTE_DAYS'] = (df['EXPIRY_DT'] - pd.to_datetime(current_date_str)).dt.days
-    df['DTE_DAYS'] = df['DTE_DAYS'].apply(lambda x: 1 if x <= 0 else x)
-    df['T'] = df['DTE_DAYS'] / 365.0 
-
-    # Basic liquidity sanity check
-    df = df[(df['CONTRACTS'] > 0) & (df['OPEN_INT'] > 0)].copy()
-
-    columns_to_keep = [
-        'SYMBOL', 'EXPIRY_DT', 'STRIKE_PR', 'OPTION_TYP', 
-        'CLOSE', 'CONTRACTS', 'OPEN_INT', 'TIMESTAMP', 'T'
-    ]
-    df = df[columns_to_keep]
-
-    # Glass Engine Step: Attach Spot, EMA_20, and EMA_DIST_PCT
-    ema_metrics = sync_cash_and_compute_ema(df_cash, current_date_str, db_path=db_path)
-    df = pd.merge(df, ema_metrics, on='SYMBOL', how='left')
-    
-    df.rename(columns={
-        'OPTION_TYP': 'TYPE',
-        'CLOSE': 'OPT_PRICE',
-        'CONTRACTS': 'VOLUME',
-        'STRIKE_PR': 'STRIKE'
-    }, inplace=True)
-    
-    df.dropna(subset=['SPOT_PRICE', 'EMA_20'], inplace=True)
-    
-    # Enforce float typing for Greeks computation
-    df['SPOT_PRICE'] = df['SPOT_PRICE'].astype(float)
-    df['EMA_20'] = df['EMA_20'].astype(float)
-    df['EMA_DIST_PCT'] = df['EMA_DIST_PCT'].astype(float)
-    df['STRIKE'] = df['STRIKE'].astype(float)
-    df['OPT_PRICE'] = df['OPT_PRICE'].astype(float)
-    
-    return df
-
-# ==============================================================================
-# 4. QUANTITATIVE ENGINE (BLACK-SCHOLES IV & GREEKS)
-# ==============================================================================
-def calculate_iv_and_greeks_vectorized(df, risk_free_rate=0.07):
-    """
-    Vectorized Black-Scholes solver. Computes IV and DELTA per row.
-    """
-    S = df['SPOT_PRICE'].values
-    K = df['STRIKE'].values
-    T = df['T'].values
-    P = df['OPT_PRICE'].values
-    types = df['TYPE'].values
-    r = risk_free_rate
-
-    sigma = np.full(S.shape, 0.30) 
-    MAX_ITER = 100
-    TOLERANCE = 1e-4
-
-    for _ in range(MAX_ITER):
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
+        # Adjust header mapping for legacy formats
+        bhav_df.columns = bhav_df.columns.astype(str).str.strip().str.upper().str.replace("_", "")
+        sym_col = next((c for c in bhav_df.columns if 'SYMB' in c), None)
+        symbols = bhav_df[sym_col].dropna().unique().tolist()
         
-        call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        put_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        # Remove Indices
+        symbols = [s for s in symbols if s not in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]]
         
-        price_est = np.where(types == 'CE', call_price, put_price)
-        
-        vega = S * norm.pdf(d1) * np.sqrt(T)
-        vega = np.where(vega < 1e-6, 1e-6, vega) 
-        
-        diff = price_est - P
-        step = diff / vega
-        
-        sigma -= step
-        sigma = np.maximum(sigma, 0.01)
-        
-        if np.max(np.abs(diff)) < TOLERANCE:
-            break
-
-    # Final pass: Calculate IV and Delta
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    call_delta = norm.cdf(d1)
-    put_delta = call_delta - 1.0
-
-    df['IV'] = np.round(sigma * 100, 2)
-    df['DELTA'] = np.round(np.where(types == 'CE', call_delta, put_delta), 4)
-    
-    return df
-
-# ==============================================================================
-# 5. STORAGE & PIPELINE EXECUTION
-# ==============================================================================
-def run_daily_ingestion(target_date_str, db_path="market_data.db"):
-    print(f"--- Starting Glass Engine Pipeline for {target_date_str} ---")
-    
-    date_obj = datetime.strptime(target_date_str, "%d-%b-%Y")
-    file_paths = download_nse_bhavcopy(date_obj)
-    if not file_paths:
-        print("Pipeline aborted: failed to download NSE Bhavcopy.")
+    except Exception as e:
+        print(f"❌ Failed to read symbols from Bhavcopy: {e}")
         return
 
-    print("Cleaning data and computing 20-day EMA from Cash Bhavcopy...")
-    clean_df = clean_bhavcopy_for_db(file_paths['fo'], file_paths['cash'], date_obj, db_path=db_path)
+    # 2. Fetch Data from yfinance
+    yf_tickers = " ".join([f"{sym}.NS" for sym in symbols])
+    print(f"📡 Fetching historical data for {len(symbols)} symbols...")
+    data = yf.download(yf_tickers, period="3mo", progress=True, threads=True)
     
-    print("Calculating Implied Volatility and Option Greeks...")
-    final_df = calculate_iv_and_greeks_vectorized(clean_df, risk_free_rate=0.07) 
+    records = []
+    closes = data['Close']
+    highs = data['High']
+    lows = data['Low']
     
-    print("Writing enriched data to SQLite database...")
-    conn = sqlite3.connect(db_path)
-    final_df.drop(columns=['T'], inplace=True)
-    
-    final_df.to_sql("options_history", conn, if_exists="append", index=False)
-    
+    # Optional: fetch NIFTY for Beta calculation
+    nifty_data = yf.download("^NSEI", period="3mo", progress=False)['Close']
+    if not nifty_data.empty:
+        nifty_returns = nifty_data.pct_change().dropna()
+    else:
+        nifty_returns = None
+        
+    for sym in symbols:
+        yf_sym = f"{sym}.NS"
+        try:
+            if isinstance(closes, pd.DataFrame) and yf_sym in closes.columns:
+                sym_close = closes[yf_sym].dropna()
+                sym_high = highs[yf_sym].dropna()
+                sym_low = lows[yf_sym].dropna()
+            else:
+                continue
+                
+            if len(sym_close) < 20:
+                continue
+                
+            spot_price = sym_close.iloc[-1]
+            ema_20 = sym_close.ewm(span=20, adjust=False).mean().iloc[-1]
+            
+            # ATR
+            df_calc = pd.DataFrame({'High': sym_high, 'Low': sym_low, 'Close': sym_close})
+            atr_14 = calculate_atr(df_calc).iloc[-1]
+            
+            # Beta
+            beta = 1.0
+            if nifty_returns is not None:
+                sym_returns = sym_close.pct_change().dropna()
+                aligned_returns = pd.concat([sym_returns, nifty_returns], axis=1).dropna()
+                if len(aligned_returns) > 20:
+                    cov = np.cov(aligned_returns.iloc[:, 0], aligned_returns.iloc[:, 1])[0][1]
+                    var = np.var(aligned_returns.iloc[:, 1])
+                    beta = cov / var if var != 0 else 1.0
+            
+            # Mock Event DTE (Normally fetched from earnings calendar)
+            days_to_event = 30 
+            
+            records.append((sym, spot_price, atr_14, beta, days_to_event, ema_20))
+            
+        except Exception:
+            continue
+
+    # 3. Save to SQLite
+    print("💾 Saving context to market_data.db...")
+    conn = sqlite3.connect('market_data.db')
     cursor = conn.cursor()
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_time ON options_history(SYMBOL, TIMESTAMP)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_strike_opt ON options_history(SYMBOL, EXPIRY_DT, STRIKE, TYPE)")
-    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_context (
+            Symbol TEXT PRIMARY KEY,
+            Spot_Price REAL,
+            ATR_14 REAL,
+            Beta REAL,
+            Days_To_Event INTEGER,
+            EMA_20 REAL
+        )
+    ''')
+    cursor.execute('DELETE FROM market_context') # Clear old data
+    cursor.executemany('''
+        INSERT INTO market_context (Symbol, Spot_Price, ATR_14, Beta, Days_To_Event, EMA_20)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', records)
     conn.commit()
     conn.close()
-    
-    print(f"Success! {len(final_df)} contracts enriched with SPOT_PRICE, EMA_20, EMA_DIST_PCT, IV, and DELTA.")
+    print("✅ Database built successfully. Ready for Streamlit.")
 
 if __name__ == "__main__":
-    run_daily_ingestion("06-OCT-2026")
+    # Provide the path to your downloaded Bhavcopy here before running
+    update_market_database("BhavCopy.csv") 
