@@ -39,16 +39,11 @@ class OptionsDataIngestion:
             "STRKPRIC": "Strike", "STRKPRC": "Strike", "STRIKEPRC": "Strike", "STRIKE": "Strike",
             "OPNINTRST": "OI", "OINOCON": "OI", "OPENINT": "OI", "OI": "OI",
             "CHNGINOPNINTRST": "OI_Change", "CHGINOI": "OI_Change", "CHGOI": "OI_Change", 
-            "CHNGINOI": "OI_Change", "CHANGEINOI": "OI_Change",
             "CLSPRIC": "LTP", "SETTLMPRIC": "LTP", "CLOSEPRIC": "LTP", "CLOSE": "LTP", "LTP": "LTP",
             "FININSTRMACTLXPRYDT": "Expiry_Date", "EXPIRYDT": "Expiry_Date", "XPIRYDT": "Expiry_Date",
             "EXPRYDT": "Expiry_Date", "EXPIRATIONDATE": "Expiry_Date", "EXPIRYDATE": "Expiry_Date"
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
-
-        if "OI_Change" not in df.columns:
-            fuzzy_oi_cols = [c for c in df.columns if ("CHG" in c or "CHNG" in c) and ("OI" in c or "OPN" in c)]
-            if fuzzy_oi_cols: df["OI_Change"] = df[fuzzy_oi_cols[0]]
 
         if "CONTRACTD" in df.columns:
             if "Option_Type" not in df.columns:
@@ -66,45 +61,47 @@ class OptionsDataIngestion:
         df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
         df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0)
         df["LTP"] = pd.to_numeric(df.get("LTP", 0.0), errors="coerce").fillna(0.0)
-        df["OI_Change"] = pd.to_numeric(df.get("OI_Change", 0.0), errors="coerce").fillna(0)
         df["Expiry_Date"] = pd.to_datetime(df.get("Expiry_Date", pd.NaT), errors="coerce")
 
-        return df.dropna(subset=["Symbol", "Option_Type", "Strike"])[['Symbol', 'Expiry_Date', 'Option_Type', 'Strike', 'LTP', 'OI', 'OI_Change']]
+        return df.dropna(subset=["Symbol", "Option_Type", "Strike"])[['Symbol', 'Expiry_Date', 'Option_Type', 'Strike', 'LTP', 'OI']]
 
 class QuantitativeScoringEngine:
-    def __init__(self, options_df, risk_free_rate=0.07):
+    def __init__(self, options_df, market_data_df, risk_free_rate=0.07):
         self.df = options_df.copy()
+        self.market_data = market_data_df
         self.r = risk_free_rate
 
     def run_glass_box_pipeline(self, current_date):
-        self._derive_spot_and_context()
+        self._merge_market_context()
         self._detect_institutional_walls()
         self._compute_moats()
         self._compute_delta(current_date)
         self._generate_composite_score()
         return self.df
 
-    def _derive_spot_and_context(self):
-        try:
-            valid_df = self.df[self.df['LTP'] > 0] 
-            pivot_df = valid_df.pivot_table(index=['Symbol', 'Strike'], columns='Option_Type', values='LTP', aggfunc='first').reset_index()
-            
-            if 'CE' in pivot_df.columns and 'PE' in pivot_df.columns:
-                pivot_df = pivot_df.dropna(subset=['CE', 'PE'])
-                pivot_df['Diff'] = np.abs(pivot_df['CE'] - pivot_df['PE'])
-                idx_min = pivot_df.groupby('Symbol')['Diff'].idxmin().dropna()
-                atm_map = pivot_df.loc[idx_min].set_index('Symbol')['Strike']
-                self.df['Spot_Price'] = self.df['Symbol'].map(atm_map)
-            else:
-                self.df['Spot_Price'] = self.df['Strike']
-        except Exception:
-            self.df['Spot_Price'] = self.df['Strike']
+    def _merge_market_context(self):
+        # Merge database context
+        if not self.market_data.empty:
+            self.df = pd.merge(self.df, self.market_data, on='Symbol', how='left')
 
-        self.df['Spot_Price'] = self.df.get('Spot_Price', self.df['Strike']).fillna(self.df['Strike'])
-        self.df['ATR_14'] = self.df['Spot_Price'] * 0.025
-        self.df['Beta'] = 1.0
-        self.df['Days_To_Event'] = 30
-        self.df.dropna(subset=['Spot_Price'], inplace=True)
+        # Fallbacks to prevent KeyErrors if database is missing
+        if 'Spot_Price' not in self.df.columns:
+            self.df['Spot_Price'] = self.df['Strike']
+        if 'EMA_20' not in self.df.columns:
+            self.df['EMA_20'] = self.df['Spot_Price']
+        if 'ATR_14' not in self.df.columns:
+            self.df['ATR_14'] = self.df['Spot_Price'] * 0.02
+        if 'Beta' not in self.df.columns:
+            self.df['Beta'] = 1.0
+        if 'Days_To_Event' not in self.df.columns:
+            self.df['Days_To_Event'] = 30
+
+        self.df['EMA_DIST_PCT'] = np.where(
+            self.df['EMA_20'] > 0, 
+            np.round(((self.df['Spot_Price'] - self.df['EMA_20']) / self.df['EMA_20']) * 100, 2), 
+            0.0
+        )
+        self.df.dropna(subset=['Spot_Price', 'EMA_20'], inplace=True)
 
     def _detect_institutional_walls(self):
         idx_call_wall = self.df[self.df['Option_Type'] == 'CE'].groupby('Symbol')['OI'].idxmax()
@@ -118,7 +115,7 @@ class QuantitativeScoringEngine:
 
         self.df['Outside_Inst_Wall'] = np.where(
             self.df['Option_Type'] == 'CE',
-            self.df['Strike'] >= self.df['Call_Wall'],
+            (self.df['Strike'] >= self.df['Call_Wall']) | (self.df['Strike'] >= self.df['EMA_20']),
             self.df['Strike'] <= self.df['Put_Wall']
         )
 
@@ -153,10 +150,19 @@ class QuantitativeScoringEngine:
 
     def _generate_composite_score(self):
         self.df['Pass_Event'] = self.df['Days_To_Event'] > 14
+        
+        # Guarantees Regime_Aligned exists to prevent pipeline crashes
+        self.df['Regime_Aligned'] = np.where(
+            self.df['Option_Type'] == 'CE',
+            self.df['Spot_Price'] < self.df['EMA_20'],
+            self.df['Spot_Price'] > self.df['EMA_20']
+        )
+            
         score = np.zeros(len(self.df))
-        score += 15 
         score += np.where(self.df['Pass_Delta'], 25, 0)
         score += np.where(self.df['Pass_Moat'], 25, 0)
         score += np.where(self.df['Outside_Inst_Wall'], 20, 0)
         score += np.where(self.df['Pass_Event'], 15, 0)
+        score += np.where(self.df['Regime_Aligned'], 15, -40) 
+        
         self.df['Composite_Score'] = score
