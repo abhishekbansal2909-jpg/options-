@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import os
@@ -195,6 +196,12 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
     if 'Wall_Strength' in display_df.columns:
         display_df = display_df[display_df["Wall_Strength"].isin(wall_filter)]
     
+    # CRITICAL FIX: Multi-Level Sorting to push the best setups to the top
+    if 'Net_Premium' in display_df.columns and 'Score' in display_df.columns:
+        display_df = display_df.sort_values(by=['Score', 'Net_Premium'], ascending=[False, False])
+    elif 'Score' in display_df.columns:
+        display_df = display_df.sort_values(by=['Score'], ascending=False)
+    
     st.caption(f"Showing **{len(display_df)}** statistically filtered setups.")
     
     available_cols = display_df.columns.tolist()
@@ -229,4 +236,3 @@ if 'spreads_df' in st.session_state and not st.session_state['spreads_df'].empty
         use_container_width=True,
         hide_index=True
     )
-
